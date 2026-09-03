@@ -1,0 +1,13 @@
+.env
+.webui_secret_key
+.venv-ocr/
+.paddlex-cache/
+.ingestion/
+.drive-cache/
+.venv-rag/
+__pycache__/
+ocr-output.txt
+frontend/node_modules/
+frontend/*.tsbuildinfo
+frontend/vite.config.js
+frontend/vite.config.d.ts
