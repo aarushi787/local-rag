@@ -17,3 +17,7 @@ cloudflare/*.pem
 cloudflare/*.token
 cloudflare/logs/
 tools/cloudflared.exe
+training-data/
+training-output/
+models/*.gguf
+models/*.safetensors

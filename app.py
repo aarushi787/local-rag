@@ -15,6 +15,7 @@ import uuid
 from contextlib import contextmanager
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Iterator, Literal
@@ -67,6 +68,10 @@ RUN_MIGRATIONS = os.getenv("RUN_MIGRATIONS", "true").lower() in {"1", "true", "y
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_MB", "25")) * 1024 * 1024
 MAX_QUEUED_REQUESTS = int(os.getenv("MAX_QUEUED_REQUESTS", "5"))
 QUEUE_WAIT_SECONDS = float(os.getenv("QUEUE_WAIT_SECONDS", "180"))
+INGESTION_WORKERS = int(os.getenv("INGESTION_WORKERS", "1"))
+MAX_PENDING_INGESTION_JOBS = int(os.getenv("MAX_PENDING_INGESTION_JOBS", "10"))
+NEON_CONNECT_RETRIES = int(os.getenv("NEON_CONNECT_RETRIES", "3"))
+NEON_RETRY_SECONDS = float(os.getenv("NEON_RETRY_SECONDS", "2"))
 REQUEST_TIMEOUT_SECONDS = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "360"))
 RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "60"))
 RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
@@ -85,13 +90,31 @@ FRONTEND_DIST = PROJECT_DIR / "frontend" / "dist"
 INGESTION_DIR = PROJECT_DIR / ".ingestion"
 MASTER_USER_ID = uuid.uuid5(uuid.NAMESPACE_URL, "local-rag:environment-admin")
 
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+class SafeJsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        if record.exc_info:
+            payload["error_type"] = record.exc_info[0].__name__
+        return json.dumps(payload, ensure_ascii=False)
+
+
+_log_handler = logging.StreamHandler()
+_log_handler.setFormatter(SafeJsonFormatter())
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"), handlers=[_log_handler], force=True
+)
 LOGGER = logging.getLogger("local_rag")
 API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 # One Ollama operation at a time prevents parallel contexts and models from
 # exhausting the laptop's limited system memory.
 MODEL_GATE = InferenceQueue(MAX_QUEUED_REQUESTS, QUEUE_WAIT_SECONDS)
+INGESTION_GATE = threading.BoundedSemaphore(max(1, INGESTION_WORKERS))
 CANCEL_EVENTS: dict[str, threading.Event] = {}
 CANCEL_EVENTS_LOCK = threading.Lock()
 DB_POOL: ConnectionPool | None = None
@@ -183,6 +206,7 @@ class ChatCompletionRequest(BaseModel):
     document_id: uuid.UUID | None = None
     profile: Literal["auto", "fast", "balanced", "quality"] | None = None
     save: bool = True
+    replace_last: bool = False
 
 
 class DocumentRequest(BaseModel):
@@ -199,6 +223,14 @@ class ConversationRequest(BaseModel):
     model: str = Field(default=DEFAULT_CHAT_MODEL, min_length=1, max_length=160)
 
 
+class ConversationUpdateRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=160)
+
+
+class ConversationTrainingRequest(BaseModel):
+    approved: bool
+
+
 class UserRequest(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     role: Literal["admin", "user"] = "user"
@@ -208,6 +240,11 @@ class PermissionRequest(BaseModel):
     user_id: uuid.UUID
     can_read: bool = True
     can_write: bool = False
+
+
+class EvaluationRequest(BaseModel):
+    pipeline: Literal["baseline", "upgraded"] = "upgraded"
+    include_generation: bool = False
 
 
 @dataclass(frozen=True)
@@ -382,13 +419,47 @@ def database_url() -> str:
     return value
 
 
+def validate_configuration() -> None:
+    errors: list[str] = []
+    if REQUIRE_API_KEY and len(API_KEY) < 32:
+        errors.append("RAG_API_KEY must contain at least 32 characters when REQUIRE_API_KEY=true")
+    if REQUEST_TIMEOUT_SECONDS < 10:
+        errors.append("REQUEST_TIMEOUT_SECONDS must be at least 10")
+    if MAX_UPLOAD_BYTES <= 0:
+        errors.append("MAX_UPLOAD_MB must be greater than zero")
+    if MAX_QUEUED_REQUESTS < 0:
+        errors.append("MAX_QUEUED_REQUESTS cannot be negative")
+    if INGESTION_WORKERS < 1:
+        errors.append("INGESTION_WORKERS must be at least 1")
+    for origin in ALLOWED_ORIGINS:
+        if not origin.startswith(("http://", "https://")):
+            errors.append("Every ALLOWED_ORIGINS entry must be a complete HTTP or HTTPS origin")
+    if errors:
+        raise RuntimeError("Invalid Local RAG configuration: " + "; ".join(errors))
+
+
+def connect_database_with_retry() -> psycopg.Connection:
+    last_error: Exception | None = None
+    for attempt in range(1, max(1, NEON_CONNECT_RETRIES) + 1):
+        try:
+            return psycopg.connect(database_url(), connect_timeout=10)
+        except psycopg.OperationalError as exc:
+            last_error = exc
+            if attempt >= max(1, NEON_CONNECT_RETRIES):
+                break
+            LOGGER.warning("Neon connection retry attempt=%s", attempt)
+            time.sleep(max(0, NEON_RETRY_SECONDS) * attempt)
+    assert last_error is not None
+    raise last_error
+
+
 @contextmanager
 def db_connection():
     if DB_POOL is not None:
         with DB_POOL.connection() as conn:
             yield conn
         return
-    with psycopg.connect(database_url(), connect_timeout=10) as conn:
+    with connect_database_with_retry() as conn:
         register_vector(conn)
         yield conn
 
@@ -402,19 +473,36 @@ def open_database_pool() -> None:
     global DB_POOL
     if DB_POOL is not None:
         return
-    DB_POOL = ConnectionPool(
-        conninfo=database_url(),
-        min_size=1,
-        max_size=4,
-        timeout=15,
-        kwargs={"connect_timeout": 10},
-        configure=configure_database_connection,
-        check=ConnectionPool.check_connection,
-        open=True,
-        name="local-rag-neon",
-        max_idle=120,
-    )
-    DB_POOL.wait(timeout=15)
+    last_error: Exception | None = None
+    for attempt in range(1, max(1, NEON_CONNECT_RETRIES) + 1):
+        candidate: ConnectionPool | None = None
+        try:
+            candidate = ConnectionPool(
+                conninfo=database_url(),
+                min_size=1,
+                max_size=4,
+                timeout=15,
+                kwargs={"connect_timeout": 10},
+                configure=configure_database_connection,
+                check=ConnectionPool.check_connection,
+                open=True,
+                name="local-rag-neon",
+                max_idle=120,
+                reconnect_timeout=60,
+            )
+            candidate.wait(timeout=15)
+            DB_POOL = candidate
+            return
+        except Exception as exc:
+            last_error = exc
+            if candidate is not None:
+                candidate.close()
+            if attempt >= max(1, NEON_CONNECT_RETRIES):
+                break
+            LOGGER.warning("Neon pool retry attempt=%s", attempt)
+            time.sleep(max(0, NEON_RETRY_SECONDS) * attempt)
+    assert last_error is not None
+    raise last_error
 
 
 def ollama_get(path: str, timeout: int = 15) -> dict:
@@ -617,7 +705,7 @@ def chunk_pages(pages: list[DocumentPage], size: int, overlap: int) -> list[dict
     return records
 
 
-def initialize_database() -> None:
+def _initialize_database_once() -> None:
     statements = [
         "CREATE EXTENSION IF NOT EXISTS vector",
         """
@@ -659,6 +747,9 @@ def initialize_database() -> None:
         )
         """,
         "ALTER TABLE rag_conversations ADD COLUMN IF NOT EXISTS owner_user_id UUID REFERENCES rag_users(id)",
+        "ALTER TABLE rag_conversations ADD COLUMN IF NOT EXISTS training_approved BOOLEAN NOT NULL DEFAULT FALSE",
+        "ALTER TABLE rag_conversations ADD COLUMN IF NOT EXISTS training_approved_at TIMESTAMPTZ",
+        "ALTER TABLE rag_conversations ADD COLUMN IF NOT EXISTS training_approved_by UUID REFERENCES rag_users(id)",
         """
         CREATE TABLE IF NOT EXISTS rag_messages (
             id UUID PRIMARY KEY,
@@ -803,8 +894,37 @@ def initialize_database() -> None:
             retrieval_ms DOUBLE PRECISION NOT NULL DEFAULT 0
         )
         """,
+        "ALTER TABLE rag_evaluation_runs ADD COLUMN IF NOT EXISTS dataset_version TEXT NOT NULL DEFAULT 'v1'",
+        "ALTER TABLE rag_evaluation_runs ADD COLUMN IF NOT EXISTS pipeline_version TEXT NOT NULL DEFAULT 'upgraded-v3'",
+        "ALTER TABLE rag_evaluation_runs ADD COLUMN IF NOT EXISTS include_generation BOOLEAN NOT NULL DEFAULT FALSE",
+        "ALTER TABLE rag_evaluation_runs ADD COLUMN IF NOT EXISTS top5_hits INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE rag_evaluation_runs ADD COLUMN IF NOT EXISTS citation_correct_hits INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE rag_evaluation_runs ADD COLUMN IF NOT EXISTS grounded_answer_hits INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE rag_evaluation_runs ADD COLUMN IF NOT EXISTS unsupported_claim_hits INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE rag_evaluation_runs ADD COLUMN IF NOT EXISTS refusal_correct_hits INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE rag_evaluation_runs ADD COLUMN IF NOT EXISTS generated_questions INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE rag_evaluation_runs ADD COLUMN IF NOT EXISTS total_first_token_ms DOUBLE PRECISION NOT NULL DEFAULT 0",
+        "ALTER TABLE rag_evaluation_runs ADD COLUMN IF NOT EXISTS total_latency_ms DOUBLE PRECISION NOT NULL DEFAULT 0",
+        "ALTER TABLE rag_evaluation_runs ADD COLUMN IF NOT EXISTS total_generation_tps DOUBLE PRECISION NOT NULL DEFAULT 0",
+        "ALTER TABLE rag_evaluation_runs ADD COLUMN IF NOT EXISTS cache_hits INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE rag_evaluation_results ADD COLUMN IF NOT EXISTS expected_page INTEGER",
+        "ALTER TABLE rag_evaluation_results ADD COLUMN IF NOT EXISTS expected_section TEXT",
+        "ALTER TABLE rag_evaluation_results ADD COLUMN IF NOT EXISTS required_facts JSONB NOT NULL DEFAULT '[]'::jsonb",
+        "ALTER TABLE rag_evaluation_results ADD COLUMN IF NOT EXISTS should_refuse BOOLEAN NOT NULL DEFAULT FALSE",
+        "ALTER TABLE rag_evaluation_results ADD COLUMN IF NOT EXISTS top5_hit BOOLEAN NOT NULL DEFAULT FALSE",
+        "ALTER TABLE rag_evaluation_results ADD COLUMN IF NOT EXISTS citation_correct BOOLEAN",
+        "ALTER TABLE rag_evaluation_results ADD COLUMN IF NOT EXISTS grounded_answer BOOLEAN",
+        "ALTER TABLE rag_evaluation_results ADD COLUMN IF NOT EXISTS unsupported_claim BOOLEAN",
+        "ALTER TABLE rag_evaluation_results ADD COLUMN IF NOT EXISTS refusal_correct BOOLEAN",
+        "ALTER TABLE rag_evaluation_results ADD COLUMN IF NOT EXISTS first_token_ms DOUBLE PRECISION",
+        "ALTER TABLE rag_evaluation_results ADD COLUMN IF NOT EXISTS total_latency_ms DOUBLE PRECISION",
+        "ALTER TABLE rag_evaluation_results ADD COLUMN IF NOT EXISTS generation_tps DOUBLE PRECISION",
+        "ALTER TABLE rag_evaluation_results ADD COLUMN IF NOT EXISTS cache_hit BOOLEAN",
     ]
-    with psycopg.connect(database_url(), connect_timeout=10) as conn:
+    with connect_database_with_retry() as conn:
+        # Every migration is idempotent. Autocommit keeps schema locks brief so
+        # a background ingestion on another process cannot deadlock the entire batch.
+        conn.autocommit = True
         conn.execute(statements[0])
         register_vector(conn)
         for statement in statements[1:]:
@@ -929,6 +1049,28 @@ def initialize_database() -> None:
             )
 
 
+def initialize_database() -> None:
+    retryable = (
+        psycopg.errors.DeadlockDetected,
+        psycopg.errors.LockNotAvailable,
+        psycopg.errors.SerializationFailure,
+        psycopg.OperationalError,
+    )
+    last_error: Exception | None = None
+    for attempt in range(1, max(1, NEON_CONNECT_RETRIES) + 1):
+        try:
+            _initialize_database_once()
+            return
+        except retryable as exc:
+            last_error = exc
+            if attempt >= max(1, NEON_CONNECT_RETRIES):
+                break
+            LOGGER.warning("Database migration retry attempt=%s", attempt)
+            time.sleep(max(0, NEON_RETRY_SECONDS) * attempt)
+    assert last_error is not None
+    raise last_error
+
+
 def prepare_conversation(
     request: ChatCompletionRequest,
     question: str,
@@ -947,6 +1089,19 @@ def prepare_conversation(
             ).fetchone()
             if not exists:
                 raise HTTPException(status_code=404, detail="conversation not found")
+            if request.replace_last:
+                conn.execute(
+                    """
+                    DELETE FROM rag_messages
+                    WHERE id IN (
+                        SELECT id FROM rag_messages
+                        WHERE conversation_id = %s
+                        ORDER BY created_at DESC, id DESC
+                        LIMIT 2
+                    )
+                    """,
+                    (conversation_id,),
+                )
         else:
             title = " ".join(question.split())[:80] or "New conversation"
             conn.execute(
@@ -1363,6 +1518,58 @@ def retrieve(
     return unique
 
 
+def retrieve_baseline(
+    question: str,
+    top_k: int = 5,
+    principal: Principal | None = None,
+) -> list[dict]:
+    """Original semantic-only retrieval retained for controlled comparisons."""
+    principal = principal or Principal(MASTER_USER_ID, "Local administrator", "admin")
+    vector = Vector(list(cached_query_embedding(question)))
+    with db_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT c.id, c.document_id, c.source, d.original_filename,
+                   c.page_number, c.chunk_index, c.bbox, c.section_title,
+                   c.content, 1 - (c.embedding <=> %(embedding)s) AS similarity
+            FROM rag_chunks c
+            LEFT JOIN rag_documents d ON d.id = c.document_id
+            WHERE c.embedding_model = %(embedding_model)s
+              AND (%(is_admin)s OR EXISTS (
+                  SELECT 1 FROM rag_document_permissions permission
+                  WHERE permission.document_id = c.document_id
+                    AND permission.user_id = %(user_id)s AND permission.can_read
+              ))
+            ORDER BY c.embedding <=> %(embedding)s
+            LIMIT %(top_k)s
+            """,
+            {
+                "embedding": vector,
+                "embedding_model": EMBEDDING_MODEL,
+                "is_admin": principal.is_admin,
+                "user_id": principal.id,
+                "top_k": max(1, min(top_k, 20)),
+            },
+        ).fetchall()
+    return [
+        {
+            "id": row[0],
+            "document_id": str(row[1]) if row[1] else None,
+            "source": row[2],
+            "filename": row[3] or row[2],
+            "page_number": row[4],
+            "chunk_index": row[5],
+            "bbox": row[6],
+            "section_title": row[7],
+            "content": row[8],
+            "similarity": float(row[9]),
+            "hybrid_score": float(row[9]),
+            "rerank_score": float(row[9]),
+        }
+        for row in rows
+    ]
+
+
 def is_conversational_message(question: str) -> bool:
     normalized = " ".join(re.findall(r"[a-z0-9']+", question.lower()))
     conversational = {
@@ -1673,6 +1880,7 @@ def source_payload(rows: list[dict]) -> list[dict]:
             "page_number": row["page_number"],
             "chunk_index": row.get("chunk_index"),
             "bbox": row.get("bbox"),
+            "section_title": row.get("section_title"),
             "similarity": round(row["similarity"], 4),
             "rerank_score": round(row.get("rerank_score", 0), 4),
             "quote": row["content"][:240],
@@ -1962,6 +2170,7 @@ def error_detail(exc: Exception) -> str:
 
 @app.on_event("startup")
 def startup() -> None:
+    validate_configuration()
     if os.getenv("DATABASE_URL") and RUN_MIGRATIONS:
         initialize_database()
     if os.getenv("DATABASE_URL"):
@@ -2061,7 +2270,7 @@ def readiness() -> JSONResponse:
     return health()
 
 
-@app.get("/v1/models")
+@app.get("/v1/models", dependencies=[Depends(require_api_key)])
 def models() -> dict:
     try:
         tags = ollama_get("/api/tags")
@@ -2081,7 +2290,7 @@ def models() -> dict:
     return {"object": "list", "data": data}
 
 
-@app.get("/v1/profiles")
+@app.get("/v1/profiles", dependencies=[Depends(require_api_key)])
 def profiles() -> dict:
     try:
         installed = {
@@ -2215,7 +2424,7 @@ def list_conversations(
             rows = conn.execute(
                 """
                 SELECT c.id, c.title, c.model, c.created_at, c.updated_at,
-                       COUNT(m.id) AS message_count
+                       COUNT(m.id) AS message_count, c.training_approved
                 FROM rag_conversations c
                 LEFT JOIN rag_messages m ON m.conversation_id = c.id
                 WHERE %s OR c.owner_user_id = %s
@@ -2238,6 +2447,7 @@ def list_conversations(
                 "created_at": row[3].isoformat(),
                 "updated_at": row[4].isoformat(),
                 "message_count": row[5],
+                "training_approved": row[6],
             }
             for row in rows
         ],
@@ -2253,7 +2463,7 @@ def get_conversation(
         with db_connection() as conn:
             conversation = conn.execute(
                 """
-                SELECT id, title, model, created_at, updated_at
+                SELECT id, title, model, created_at, updated_at, training_approved
                 FROM rag_conversations WHERE id = %s AND (%s OR owner_user_id = %s)
                 """,
                 (conversation_id, principal.is_admin, principal.id),
@@ -2280,6 +2490,7 @@ def get_conversation(
         "model": conversation[2],
         "created_at": conversation[3].isoformat(),
         "updated_at": conversation[4].isoformat(),
+        "training_approved": conversation[5],
         "messages": [
             {
                 "id": str(row[0]),
@@ -2292,6 +2503,69 @@ def get_conversation(
             for row in messages
         ],
     }
+
+
+@app.patch("/v1/conversations/{conversation_id}")
+def update_conversation(
+    conversation_id: uuid.UUID,
+    request: ConversationUpdateRequest,
+    principal: Principal = Depends(require_api_key),
+) -> dict:
+    title = " ".join(request.title.split())
+    try:
+        with db_connection() as conn:
+            row = conn.execute(
+                """
+                UPDATE rag_conversations
+                SET title = %s, updated_at = NOW()
+                WHERE id = %s AND (%s OR owner_user_id = %s)
+                RETURNING id, title, model, updated_at
+                """,
+                (title, conversation_id, principal.is_admin, principal.id),
+            ).fetchone()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=error_detail(exc)) from exc
+    if not row:
+        raise HTTPException(status_code=404, detail="conversation not found")
+    return {
+        "id": str(row[0]),
+        "title": row[1],
+        "model": row[2],
+        "updated_at": row[3].isoformat(),
+    }
+
+
+@app.put("/v1/conversations/{conversation_id}/training-approval")
+def set_conversation_training_approval(
+    conversation_id: uuid.UUID,
+    request: ConversationTrainingRequest,
+    principal: Principal = Depends(require_admin),
+) -> dict:
+    try:
+        with db_connection() as conn:
+            row = conn.execute(
+                """
+                UPDATE rag_conversations
+                SET training_approved = %s,
+                    training_approved_at = CASE WHEN %s THEN NOW() ELSE NULL END,
+                    training_approved_by = CASE WHEN %s THEN %s ELSE NULL END,
+                    updated_at = NOW()
+                WHERE id = %s
+                RETURNING id, title, training_approved
+                """,
+                (
+                    request.approved,
+                    request.approved,
+                    request.approved,
+                    principal.id,
+                    conversation_id,
+                ),
+            ).fetchone()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=error_detail(exc)) from exc
+    if not row:
+        raise HTTPException(status_code=404, detail="conversation not found")
+    return {"id": str(row[0]), "title": row[1], "training_approved": row[2]}
 
 
 @app.delete("/v1/conversations/{conversation_id}")
@@ -2454,6 +2728,7 @@ def run_ingestion_job(
     overlap: int,
     owner_user_id: uuid.UUID,
 ) -> None:
+    INGESTION_GATE.acquire()
     try:
         update_ingestion_job(job_id, "extracting", 10)
         data = file_path.read_bytes()
@@ -2499,6 +2774,7 @@ def run_ingestion_job(
             )
     finally:
         file_path.unlink(missing_ok=True)
+        INGESTION_GATE.release()
 
 
 @app.post("/v1/ingestion-jobs", status_code=202)
@@ -2520,6 +2796,16 @@ async def create_ingestion_job(
         raise HTTPException(status_code=403, detail="Only administrators can replace a document")
     job_id = uuid.uuid4()
     checksum = hashlib.sha256(data).hexdigest()
+    with db_connection() as conn:
+        pending_jobs = conn.execute(
+            "SELECT COUNT(*) FROM rag_ingestion_jobs WHERE status IN ('queued', 'running')"
+        ).fetchone()[0]
+    if pending_jobs >= MAX_PENDING_INGESTION_JOBS:
+        raise HTTPException(
+            status_code=429,
+            detail="The ingestion queue is full. Wait for an active document to finish.",
+            headers={"Retry-After": "15"},
+        )
     if not replace:
         with db_connection() as conn:
             duplicate = conn.execute(
@@ -2591,63 +2877,200 @@ def list_ingestion_jobs(
     ]}
 
 
-def run_retrieval_evaluation(run_id: uuid.UUID, principal: Principal) -> None:
+def score_retrieval(example: dict, rows: list[dict]) -> dict:
+    expected_source = " ".join(example.get("expected_document", example.get("expected_source", "")).lower().split())
+    expected_page = example.get("expected_page")
+    expected_section = " ".join(str(example.get("expected_section") or "").lower().split())
+
+    def matches(row: dict) -> bool:
+        source = " ".join(f"{row.get('source', '')} {row.get('filename', '')}".lower().split())
+        section = " ".join(str(row.get("section_title") or "").lower().split())
+        return (
+            (not expected_source or expected_source in source)
+            and (expected_page is None or row.get("page_number") == expected_page)
+            and (not expected_section or expected_section in section)
+        )
+
+    rank = next((index for index, row in enumerate(rows, start=1) if matches(row)), None)
+    required_facts = example.get("required_facts", example.get("expected_terms", []))
+    evidence = " ".join(row.get("content", row.get("quote", "")) for row in rows).lower()
+    evidence_ok = all(str(fact).lower() in evidence for fact in required_facts)
+    return {
+        "rank": rank,
+        "top1": rank == 1,
+        "top3": bool(rank and rank <= 3),
+        "top5": bool(rank and rank <= 5),
+        "evidence": evidence_ok,
+        "reciprocal": 1 / rank if rank else 0.0,
+    }
+
+
+def collect_evaluation_answer(question: str, principal: Principal) -> dict:
+    request = ChatCompletionRequest(
+        messages=[ChatMessage(role="user", content=question)],
+        profile="fast",
+        stream=True,
+        save=False,
+        max_tokens=140,
+    )
+    answer_parts: list[str] = []
+    sources: list[dict] = []
+    metrics: dict = {}
+    for frame in streaming_chat(request, principal):
+        if not frame.startswith("data:"):
+            continue
+        raw = frame[5:].strip()
+        if not raw or raw == "[DONE]":
+            continue
+        event = json.loads(raw)
+        if event.get("error"):
+            raise RuntimeError(event["error"].get("message", "Evaluation generation failed"))
+        content = event.get("choices", [{}])[0].get("delta", {}).get("content")
+        if content:
+            answer_parts.append(content)
+        if event.get("sources"):
+            sources = event["sources"]
+        if event.get("metrics"):
+            metrics = event["metrics"]
+    return {"answer": "".join(answer_parts), "sources": sources, "metrics": metrics}
+
+
+def score_generated_answer(example: dict, answer: str, sources: list[dict]) -> dict:
+    normalized = " ".join(answer.lower().split())
+    refusal = "i don't know from the supplied documents" in normalized
+    should_refuse = bool(example.get("should_refuse", False))
+    citations = [int(value) for value in re.findall(r"\[source\s+(\d+)\]", answer, re.IGNORECASE)]
+    citation_correct = (
+        not citations if should_refuse
+        else bool(citations) and all(1 <= value <= len(sources) for value in citations)
+    )
+    required_facts = example.get("required_facts", example.get("expected_terms", []))
+    facts_present = all(str(fact).lower() in normalized for fact in required_facts)
+    refusal_correct = refusal == should_refuse
+    grounded = refusal_correct if should_refuse else (facts_present and citation_correct and not refusal)
+    unsupported_claim = bool(answer.strip()) and not should_refuse and not citation_correct
+    return {
+        "citation_correct": citation_correct,
+        "grounded": grounded,
+        "unsupported_claim": unsupported_claim,
+        "refusal_correct": refusal_correct,
+    }
+
+
+def run_retrieval_evaluation(
+    run_id: uuid.UUID,
+    principal: Principal,
+    pipeline: str = "upgraded",
+    include_generation: bool = False,
+) -> None:
     try:
         dataset_path = PROJECT_DIR / "evaluation_questions.jsonl"
         examples = [
             json.loads(line) for line in dataset_path.read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
+        dataset_version = str(examples[0].get("dataset_version", "v1")) if examples else "v1"
         with db_connection() as conn:
             conn.execute(
-                "UPDATE rag_evaluation_runs SET total_questions = %s WHERE id = %s",
-                (len(examples), run_id),
+                """UPDATE rag_evaluation_runs
+                   SET total_questions = %s, dataset_version = %s,
+                       pipeline_version = %s, include_generation = %s
+                   WHERE id = %s""",
+                (len(examples), dataset_version, pipeline, include_generation, run_id),
             )
-        top1_hits = top3_hits = evidence_hits = 0
+        top1_hits = top3_hits = top5_hits = evidence_hits = 0
+        citation_hits = grounded_hits = unsupported_hits = refusal_hits = generated = cache_hits = 0
         reciprocal_total = retrieval_total = 0.0
+        first_token_total = latency_total = generation_tps_total = 0.0
         for number, example in enumerate(examples, start=1):
             started = time.perf_counter()
             with QueueLease(MODEL_GATE):
-                rows = retrieve(example["question"], top_k=5, principal=principal)
+                rows = (
+                    retrieve_baseline(example["question"], top_k=5, principal=principal)
+                    if pipeline == "baseline"
+                    else retrieve(example["question"], top_k=5, principal=principal)
+                )
             retrieval_ms = (time.perf_counter() - started) * 1000
-            expected_source = " ".join(example["expected_source"].lower().split())
-            rank = next(
-                (index for index, row in enumerate(rows, start=1)
-                 if expected_source in " ".join(row["source"].lower().split())),
-                None,
-            )
-            joined = " ".join(row["content"] for row in rows).lower()
-            evidence_ok = all(term.lower() in joined for term in example.get("expected_terms", []))
-            top1 = rank == 1
-            top3 = bool(rank and rank <= 3)
-            reciprocal = 1 / rank if rank else 0.0
-            top1_hits += int(top1)
-            top3_hits += int(top3)
-            evidence_hits += int(evidence_ok)
-            reciprocal_total += reciprocal
+            retrieval_score = score_retrieval(example, rows)
+            answer_score = {
+                "citation_correct": None,
+                "grounded": None,
+                "unsupported_claim": None,
+                "refusal_correct": None,
+            }
+            generated_result = {"answer": "", "sources": [], "metrics": {}}
+            if include_generation and pipeline == "upgraded":
+                generated_result = collect_evaluation_answer(example["question"], principal)
+                answer_score = score_generated_answer(
+                    example, generated_result["answer"], generated_result["sources"]
+                )
+                generated += 1
+                citation_hits += int(bool(answer_score["citation_correct"]))
+                grounded_hits += int(bool(answer_score["grounded"]))
+                unsupported_hits += int(bool(answer_score["unsupported_claim"]))
+                refusal_hits += int(bool(answer_score["refusal_correct"]))
+                metrics = generated_result["metrics"]
+                first_token_total += float(metrics.get("first_token_ms") or 0)
+                latency_total += float(metrics.get("total_ms") or 0)
+                generation_tps_total += float(metrics.get("generation_tokens_per_second") or 0)
+                cache_hits += int(bool(metrics.get("cache_hit")))
+
+            top1_hits += int(retrieval_score["top1"])
+            top3_hits += int(retrieval_score["top3"])
+            top5_hits += int(retrieval_score["top5"])
+            evidence_hits += int(retrieval_score["evidence"])
+            reciprocal_total += float(retrieval_score["reciprocal"])
             retrieval_total += retrieval_ms
             with db_connection() as conn:
                 conn.execute(
                     """
                     INSERT INTO rag_evaluation_results (
                         run_id, question, expected_source, retrieved_sources,
-                        top1_hit, top3_hit, evidence_hit, reciprocal_rank, retrieval_ms
-                    ) VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s)
+                        top1_hit, top3_hit, evidence_hit, reciprocal_rank, retrieval_ms,
+                        expected_page, expected_section, required_facts, should_refuse,
+                        top5_hit, citation_correct, grounded_answer, unsupported_claim,
+                        refusal_correct, first_token_ms, total_latency_ms,
+                        generation_tps, cache_hit
+                    ) VALUES (
+                        %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s,
+                        %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                    )
                     """,
-                    (run_id, example["question"], example["expected_source"],
-                     json.dumps([row["source"] for row in rows]), top1, top3,
-                     evidence_ok, reciprocal, retrieval_ms),
+                    (
+                        run_id, example["question"], example.get("expected_document", example.get("expected_source")),
+                        json.dumps([row["source"] for row in rows]), retrieval_score["top1"],
+                        retrieval_score["top3"], retrieval_score["evidence"],
+                        retrieval_score["reciprocal"], retrieval_ms,
+                        example.get("expected_page"), example.get("expected_section"),
+                        json.dumps(example.get("required_facts", example.get("expected_terms", []))),
+                        bool(example.get("should_refuse", False)), retrieval_score["top5"],
+                        answer_score["citation_correct"], answer_score["grounded"],
+                        answer_score["unsupported_claim"], answer_score["refusal_correct"],
+                        generated_result["metrics"].get("first_token_ms"),
+                        generated_result["metrics"].get("total_ms"),
+                        generated_result["metrics"].get("generation_tokens_per_second"),
+                        generated_result["metrics"].get("cache_hit"),
+                    ),
                 )
                 conn.execute(
                     """
                     UPDATE rag_evaluation_runs
                     SET completed_questions = %s, top1_hits = %s, top3_hits = %s,
-                        evidence_hits = %s, mean_reciprocal_rank = %s,
-                        average_retrieval_ms = %s
+                        top5_hits = %s, evidence_hits = %s, mean_reciprocal_rank = %s,
+                        average_retrieval_ms = %s, citation_correct_hits = %s,
+                        grounded_answer_hits = %s, unsupported_claim_hits = %s,
+                        refusal_correct_hits = %s, generated_questions = %s,
+                        total_first_token_ms = %s, total_latency_ms = %s,
+                        total_generation_tps = %s, cache_hits = %s
                     WHERE id = %s
                     """,
-                    (number, top1_hits, top3_hits, evidence_hits,
-                     reciprocal_total / number, retrieval_total / number, run_id),
+                    (
+                        number, top1_hits, top3_hits, top5_hits, evidence_hits,
+                        reciprocal_total / number, retrieval_total / number,
+                        citation_hits, grounded_hits, unsupported_hits, refusal_hits,
+                        generated, first_token_total, latency_total,
+                        generation_tps_total, cache_hits, run_id,
+                    ),
                 )
         with db_connection() as conn:
             conn.execute(
@@ -2668,20 +3091,27 @@ def run_retrieval_evaluation(run_id: uuid.UUID, principal: Principal) -> None:
 
 
 @app.post("/v1/evaluations", status_code=202)
-def create_evaluation(principal: Principal = Depends(require_admin)) -> dict:
+def create_evaluation(
+    request: EvaluationRequest,
+    principal: Principal = Depends(require_admin),
+) -> dict:
+    if request.include_generation and request.pipeline != "upgraded":
+        raise HTTPException(status_code=422, detail="Answer generation is available only for the upgraded pipeline")
     run_id = uuid.uuid4()
     with db_connection() as conn:
         conn.execute(
-            "INSERT INTO rag_evaluation_runs (id, owner_user_id) VALUES (%s, %s)",
-            (run_id, principal.id),
+            """INSERT INTO rag_evaluation_runs (
+                   id, owner_user_id, pipeline_version, include_generation
+               ) VALUES (%s, %s, %s, %s)""",
+            (run_id, principal.id, request.pipeline, request.include_generation),
         )
     threading.Thread(
         target=run_retrieval_evaluation,
-        args=(run_id, principal),
+        args=(run_id, principal, request.pipeline, request.include_generation),
         name=f"rag-eval-{run_id.hex[:8]}",
         daemon=True,
     ).start()
-    return {"id": str(run_id), "status": "running"}
+    return {"id": str(run_id), "status": "running", "pipeline": request.pipeline}
 
 
 @app.get("/v1/evaluations")
@@ -2690,8 +3120,12 @@ def list_evaluations(principal: Principal = Depends(require_admin), limit: int =
         rows = conn.execute(
             """
             SELECT id, status, total_questions, completed_questions, top1_hits,
-                   top3_hits, evidence_hits, mean_reciprocal_rank,
-                   average_retrieval_ms, error_message, created_at, finished_at
+                   top3_hits, top5_hits, evidence_hits, mean_reciprocal_rank,
+                   average_retrieval_ms, dataset_version, pipeline_version,
+                   include_generation, citation_correct_hits, grounded_answer_hits,
+                   unsupported_claim_hits, refusal_correct_hits, generated_questions,
+                   total_first_token_ms, total_latency_ms, total_generation_tps,
+                   cache_hits, error_message, created_at, finished_at
             FROM rag_evaluation_runs ORDER BY created_at DESC LIMIT %s
             """,
             (min(max(limit, 1), 50),),
@@ -2705,10 +3139,20 @@ def evaluation_payload(row: tuple) -> dict:
         "id": str(row[0]), "status": row[1], "total": total, "completed": row[3],
         "top1_rate": round(row[4] / total, 4) if total else 0,
         "top3_rate": round(row[5] / total, 4) if total else 0,
-        "evidence_rate": round(row[6] / total, 4) if total else 0,
-        "mrr": round(row[7], 4), "average_retrieval_ms": round(row[8], 2),
-        "error": row[9], "created_at": row[10].isoformat(),
-        "finished_at": row[11].isoformat() if row[11] else None,
+        "top5_rate": round(row[6] / total, 4) if total else 0,
+        "evidence_rate": round(row[7] / total, 4) if total else 0,
+        "mrr": round(row[8], 4), "average_retrieval_ms": round(row[9], 2),
+        "dataset_version": row[10], "pipeline": row[11], "include_generation": row[12],
+        "citation_correctness": round(row[13] / row[17], 4) if row[17] else None,
+        "grounded_answer_rate": round(row[14] / row[17], 4) if row[17] else None,
+        "unsupported_claim_rate": round(row[15] / row[17], 4) if row[17] else None,
+        "refusal_correctness": round(row[16] / row[17], 4) if row[17] else None,
+        "average_first_token_ms": round(row[18] / row[17], 2) if row[17] else None,
+        "average_total_latency_ms": round(row[19] / row[17], 2) if row[17] else None,
+        "average_generation_tps": round(row[20] / row[17], 2) if row[17] else None,
+        "cache_hit_rate": round(row[21] / row[17], 4) if row[17] else None,
+        "error": row[22], "created_at": row[23].isoformat(),
+        "finished_at": row[24].isoformat() if row[24] else None,
     }
 
 

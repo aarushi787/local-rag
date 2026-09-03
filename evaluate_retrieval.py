@@ -6,7 +6,7 @@ import argparse
 import json
 from pathlib import Path
 
-from app import retrieve
+from app import retrieve, retrieve_baseline, score_retrieval
 
 
 def normalize(value: str) -> str:
@@ -23,6 +23,7 @@ def main() -> None:
     )
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--limit", type=int)
+    parser.add_argument("--pipeline", choices=("baseline", "upgraded"), default="upgraded")
     args = parser.parse_args()
 
     examples = [
@@ -35,35 +36,36 @@ def main() -> None:
     if not examples:
         raise SystemExit("The evaluation dataset is empty")
 
-    source_hits = 0
+    top1_hits = 0
+    top3_hits = 0
+    top5_hits = 0
     evidence_hits = 0
     reciprocal_rank_total = 0.0
     for number, example in enumerate(examples, start=1):
-        rows = retrieve(example["question"], top_k=args.top_k)
-        expected_source = normalize(example["expected_source"])
-        rank = next(
-            (
-                index
-                for index, row in enumerate(rows, start=1)
-                if expected_source in normalize(row["source"])
-            ),
-            None,
+        rows = (
+            retrieve_baseline(example["question"], top_k=args.top_k)
+            if args.pipeline == "baseline"
+            else retrieve(example["question"], top_k=args.top_k)
         )
-        joined = normalize(" ".join(row["content"] for row in rows))
-        expected_terms = [normalize(term) for term in example.get("expected_terms", [])]
-        evidence_ok = all(term in joined for term in expected_terms)
-        source_hits += int(rank is not None)
-        evidence_hits += int(evidence_ok)
-        reciprocal_rank_total += 1 / rank if rank else 0
+        score = score_retrieval(example, rows)
+        top1_hits += int(score["top1"])
+        top3_hits += int(score["top3"])
+        top5_hits += int(score["top5"])
+        evidence_hits += int(score["evidence"])
+        reciprocal_rank_total += score["reciprocal"]
         print(
-            f"{number:02d}. {'PASS' if rank and evidence_ok else 'MISS'} "
-            f"rank={rank or '-'} question={example['question']}"
+            f"{number:02d}. {'PASS' if score['rank'] and score['evidence'] else 'MISS'} "
+            f"rank={score['rank'] or '-'} question={example['question']}"
         )
 
     count = len(examples)
     print("\nRetrieval evaluation")
     print(f"Questions: {count}")
-    print(f"Source hit@{args.top_k}: {source_hits / count:.1%}")
+    print(f"Dataset version: {examples[0].get('dataset_version', 'v1')}")
+    print(f"Pipeline: {args.pipeline}")
+    print(f"Recall@1: {top1_hits / count:.1%}")
+    print(f"Recall@3: {top3_hits / count:.1%}")
+    print(f"Recall@5: {top5_hits / count:.1%}")
     print(f"Evidence hit@{args.top_k}: {evidence_hits / count:.1%}")
     print(f"Mean reciprocal rank: {reciprocal_rank_total / count:.3f}")
 

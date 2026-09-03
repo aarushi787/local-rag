@@ -1,6 +1,7 @@
 import { FormEvent, KeyboardEvent, lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowUp,
+  ArrowCounterClockwise,
   Books,
   ChatCircle,
   ChartLineUp,
@@ -9,13 +10,16 @@ import {
   CircleNotch,
   Copy,
   Database,
+  DownloadSimple,
   FileArrowUp,
   FileText,
   Gear,
   Gauge,
   List,
+  MagnifyingGlass,
   Moon,
   Plus,
+  PencilSimple,
   ShieldCheck,
   SidebarSimple,
   SignIn,
@@ -41,6 +45,7 @@ import {
   createUser,
   CurrentUser,
   deleteConversation,
+  deleteDocument,
   DocumentRecord,
   getConversation,
   getConversations,
@@ -55,6 +60,7 @@ import {
   Health,
   Metrics,
   ResponseProfile,
+  renameConversation,
   EvaluationRun,
   IngestionJob,
   Source,
@@ -65,6 +71,7 @@ import {
   storeApiKey,
   startEvaluation,
   setDocumentPermission,
+  setConversationTrainingApproval,
   streamChat,
   uploadDocument,
   ConversationSummary,
@@ -80,6 +87,24 @@ type UiMessage = {
 };
 
 const makeId = () => crypto.randomUUID();
+const lastUserIndex = (items: UiMessage[]) => {
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    if (items[index].role === "user") return index;
+  }
+  return -1;
+};
+const ingestionPhaseLabel = (phase: string) => ({
+  queued: "Queued",
+  extracting: "OCR / extraction",
+  preparing: "Chunking",
+  chunking: "Chunking",
+  embedding: "Embedding",
+  saving: "Saving",
+  ready: "Completed",
+  duplicate: "Completed · already indexed",
+  failed: "Failed",
+  interrupted: "Interrupted"
+}[phase] || phase);
 const MarkdownContent = lazy(() => import("./MarkdownContent"));
 
 function App() {
@@ -117,6 +142,15 @@ function App() {
   const [apiUrlInput, setApiUrlInput] = useState(displayApiUrl());
   const [connecting, setConnecting] = useState(false);
   const [copiedMessage, setCopiedMessage] = useState<string | null>(null);
+  const [conversationSearch, setConversationSearch] = useState("");
+  const [documentSearch, setDocumentSearch] = useState("");
+  const [documentFilter, setDocumentFilter] = useState("all");
+  const [dragActive, setDragActive] = useState(false);
+  const [editingLastTurn, setEditingLastTurn] = useState(false);
+  const [expandedSource, setExpandedSource] = useState<number | null>(null);
+  const [renameTarget, setRenameTarget] = useState<ConversationSummary | null>(null);
+  const [renameTitle, setRenameTitle] = useState("");
+  const [deleteTarget, setDeleteTarget] = useState<{ type: "conversation" | "document"; id: string; name: string } | null>(null);
   const [uploadFile, setUploadFile] = useState<File | null>(null);
   const [uploadSource, setUploadSource] = useState("");
   const [uploading, setUploading] = useState(false);
@@ -127,6 +161,7 @@ function App() {
   const [permissionDocument, setPermissionDocument] = useState("");
   const abortRef = useRef<AbortController | null>(null);
   const endRef = useRef<HTMLDivElement>(null);
+  const composerRef = useRef<HTMLTextAreaElement>(null);
   const copyTimerRef = useRef<number | null>(null);
 
   const isHealthy = health?.status === "healthy";
@@ -142,6 +177,20 @@ function App() {
     () => [...messages].reverse().find((message) => message.role === "assistant")?.metrics,
     [messages]
   );
+  const filteredConversations = useMemo(() => {
+    const query = conversationSearch.trim().toLowerCase();
+    return query
+      ? conversations.filter((item) => item.title.toLowerCase().includes(query))
+      : conversations;
+  }, [conversationSearch, conversations]);
+  const filteredDocuments = useMemo(() => {
+    const query = documentSearch.trim().toLowerCase();
+    return documents.filter((item) => {
+      const matchesQuery = !query || `${item.source} ${item.filename}`.toLowerCase().includes(query);
+      const matchesFilter = documentFilter === "all" || item.status === documentFilter;
+      return matchesQuery && matchesFilter;
+    });
+  }, [documentFilter, documentSearch, documents]);
 
   useEffect(() => {
     localStorage.setItem("local-rag-theme", theme);
@@ -150,6 +199,22 @@ function App() {
   useEffect(() => () => {
     if (copyTimerRef.current) window.clearTimeout(copyTimerRef.current);
   }, []);
+
+  useEffect(() => {
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        composerRef.current?.focus();
+      }
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "n") {
+        event.preventDefault();
+        startNewChat();
+      }
+      if (event.key === "Escape" && generating) void stopGeneration();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  });
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: generating ? "auto" : "smooth" });
@@ -248,6 +313,7 @@ function App() {
     setMessages([]);
     setActiveSources([]);
     setError("");
+    setEditingLastTurn(false);
     setSidebarOpen(false);
   };
 
@@ -278,18 +344,71 @@ function App() {
     }
   };
 
-  const removeConversation = async (id: string) => {
+  const confirmDelete = async () => {
+    if (!deleteTarget) return;
     try {
-      await deleteConversation(id);
-      if (conversationId === id) startNewChat();
+      if (deleteTarget.type === "conversation") {
+        await deleteConversation(deleteTarget.id);
+        if (conversationId === deleteTarget.id) startNewChat();
+      } else {
+        await deleteDocument(deleteTarget.id);
+        if (selectedDocument === deleteTarget.id) setSelectedDocument("all");
+      }
+      setDeleteTarget(null);
       await refreshWorkspace();
     } catch (caught) {
       handleApiError(caught);
     }
   };
 
-  const sendPrompt = async () => {
-    const text = prompt.trim();
+  const saveConversationTitle = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!renameTarget || !renameTitle.trim()) return;
+    try {
+      await renameConversation(renameTarget.id, renameTitle.trim());
+      setRenameTarget(null);
+      await refreshWorkspace();
+    } catch (caught) {
+      handleApiError(caught);
+    }
+  };
+
+  const exportConversation = async (id: string) => {
+    try {
+      const conversation = await getConversation(id);
+      const safeTitle = conversation.title.replace(/[^a-z0-9_-]+/gi, "-").replace(/^-|-$/g, "") || "conversation";
+      const body = conversation.messages.map((message) => {
+        const citations = message.sources?.map((source) =>
+          `- ${source.filename}, page ${source.page_number || 1}`
+        ).join("\n");
+        return `## ${message.role === "user" ? "You" : "Gemma"}\n\n${message.content}${citations ? `\n\nSources:\n${citations}` : ""}`;
+      }).join("\n\n");
+      const blob = new Blob([`# ${conversation.title}\n\n${body}\n`], { type: "text/markdown;charset=utf-8" });
+      const link = document.createElement("a");
+      link.href = URL.createObjectURL(blob);
+      link.download = `${safeTitle}.md`;
+      link.click();
+      URL.revokeObjectURL(link.href);
+    } catch (caught) {
+      handleApiError(caught);
+    }
+  };
+
+  const toggleTrainingApproval = async (conversation: ConversationSummary) => {
+    try {
+      await setConversationTrainingApproval(conversation.id, !conversation.training_approved);
+      await refreshWorkspace();
+    } catch (caught) {
+      handleApiError(caught);
+    }
+  };
+
+  const sendPrompt = async (
+    textOverride?: string,
+    baseMessages?: UiMessage[],
+    replaceLast = editingLastTurn
+  ) => {
+    const text = (textOverride ?? prompt).trim();
     if (!text || generating) return;
     if (!storedApiKey()) {
       setSettingsOpen(true);
@@ -304,13 +423,17 @@ function App() {
       metrics: {}
     };
     const assistantId = makeId();
-    const requestMessages = [...messages, userMessage].map(({ role, content }) => ({ role, content }));
-    setMessages((current) => [
-      ...current,
+    const base = baseMessages ?? (replaceLast
+      ? messages.slice(0, Math.max(0, lastUserIndex(messages)))
+      : messages);
+    const requestMessages = [...base, userMessage].map(({ role, content }) => ({ role, content }));
+    setMessages([
+      ...base,
       userMessage,
       { id: assistantId, role: "assistant", content: "", sources: [], metrics: {} }
     ]);
     setPrompt("");
+    setEditingLastTurn(false);
     setGenerating(true);
     setQueuePosition(0);
     setError("");
@@ -327,7 +450,8 @@ function App() {
           document_id: selectedDocument === "all" ? undefined : selectedDocument,
           profile,
           stream: true,
-          max_tokens: 220
+          max_tokens: 220,
+          replace_last: replaceLast
         },
         {
           onQueue: (requestId, position) => {
@@ -386,6 +510,22 @@ function App() {
     }
   };
 
+  const regenerateLastResponse = () => {
+    if (generating) return;
+    const userIndex = lastUserIndex(messages);
+    if (userIndex < 0) return;
+    const previous = messages[userIndex];
+    void sendPrompt(previous.content, messages.slice(0, userIndex), true);
+  };
+
+  const editLastPrompt = () => {
+    const userIndex = lastUserIndex(messages);
+    if (userIndex < 0 || generating) return;
+    setPrompt(messages[userIndex].content);
+    setEditingLastTurn(true);
+    window.setTimeout(() => composerRef.current?.focus(), 0);
+  };
+
   const stopGeneration = async () => {
     if (activeRequestId) void cancelChat(activeRequestId).catch(() => undefined);
     abortRef.current?.abort();
@@ -440,12 +580,13 @@ function App() {
     }
   };
 
-  const runEvaluation = async () => {
+  const runEvaluation = async (pipeline: "baseline" | "upgraded", includeGeneration: boolean) => {
     try {
-      const run = await startEvaluation();
+      const run = await startEvaluation(pipeline, includeGeneration);
       setEvaluations((current) => [{
         id: run.id, status: "running", total: 0, completed: 0, top1_rate: 0,
-        top3_rate: 0, evidence_rate: 0, mrr: 0, average_retrieval_ms: 0,
+        top3_rate: 0, top5_rate: 0, evidence_rate: 0, mrr: 0, average_retrieval_ms: 0,
+        dataset_version: "v1", pipeline, include_generation: includeGeneration,
         created_at: new Date().toISOString()
       }, ...current]);
     } catch (caught) {
@@ -487,6 +628,7 @@ function App() {
 
   return (
     <Theme appearance={theme} accentColor="jade" grayColor="sage" radius="medium">
+      <a className="skip-link" href="#main-workspace">Skip to chat</a>
       <div className="app-shell">
         <button
           className={`mobile-scrim ${sidebarOpen ? "visible" : ""}`}
@@ -512,10 +654,16 @@ function App() {
 
           <nav className="conversation-list" aria-label="Saved conversations">
             <p className="section-label">Conversations</p>
+            <label className="compact-search">
+              <MagnifyingGlass aria-hidden="true" />
+              <input value={conversationSearch} onChange={(event) => setConversationSearch(event.target.value)} placeholder="Search conversations" aria-label="Search conversations" />
+            </label>
             {conversations.length === 0 ? (
               <div className="sidebar-empty">Your saved chats will appear here.</div>
+            ) : filteredConversations.length === 0 ? (
+              <div className="sidebar-empty">No conversations match that search.</div>
             ) : (
-              conversations.map((conversation) => (
+              filteredConversations.map((conversation) => (
                 <div
                   key={conversation.id}
                   className={`conversation-item ${conversation.id === conversationId ? "active" : ""}`}
@@ -530,13 +678,14 @@ function App() {
                       <small>{conversation.message_count} messages</small>
                     </span>
                   </button>
-                  <button
-                    className="delete-chat"
-                    aria-label={`Delete ${conversation.title}`}
-                    onClick={() => void removeConversation(conversation.id)}
-                  >
-                    <Trash />
-                  </button>
+                  <div className="conversation-actions">
+                    {currentUser?.role === "admin" ? (
+                      <button aria-label={`${conversation.training_approved ? "Remove" : "Approve"} ${conversation.title} for training export`} title={conversation.training_approved ? "Remove training approval" : "Approve for training export"} onClick={() => void toggleTrainingApproval(conversation)}><CheckCircle weight={conversation.training_approved ? "fill" : "regular"} /></button>
+                    ) : null}
+                    <button aria-label={`Rename ${conversation.title}`} title="Rename" onClick={() => { setRenameTarget(conversation); setRenameTitle(conversation.title); }}><PencilSimple /></button>
+                    <button aria-label={`Export ${conversation.title}`} title="Export" onClick={() => void exportConversation(conversation.id)}><DownloadSimple /></button>
+                    <button aria-label={`Delete ${conversation.title}`} title="Delete" onClick={() => setDeleteTarget({ type: "conversation", id: conversation.id, name: conversation.title })}><Trash /></button>
+                  </div>
                 </div>
               ))
             )}
@@ -558,7 +707,7 @@ function App() {
           </div>
         </aside>
 
-        <main className="workspace">
+        <main className="workspace" id="main-workspace">
           <header className="topbar">
             <IconButton className="mobile-menu" variant="ghost" onClick={() => setSidebarOpen(true)} aria-label="Open navigation">
               <List />
@@ -617,6 +766,13 @@ function App() {
             </Tooltip>
           </header>
 
+          <div className="component-statuses" aria-label="Service status">
+            <span><i className={`status-dot ${health ? "online" : "offline"}`} />Server</span>
+            <span><i className={`status-dot ${health?.ollama?.status === "connected" ? "online" : "offline"}`} />Ollama</span>
+            <span><i className={`status-dot ${health?.neon?.status === "connected" ? "online" : "offline"}`} />Neon</span>
+            <span><i className={`status-dot ${health?.warmup?.status === "ready" ? "online" : health?.warmup?.status === "warming" ? "waiting" : "offline"}`} />Model</span>
+          </div>
+
           <section className="chat-region" aria-live="polite">
             {messages.length === 0 ? (
               <div className="empty-chat">
@@ -639,7 +795,7 @@ function App() {
               </div>
             ) : (
               <div className="message-list">
-                {messages.map((message) => (
+                {messages.map((message, messageIndex) => (
                   <article
                     key={message.id}
                     className={`message ${message.role}`}
@@ -655,22 +811,32 @@ function App() {
                         <span className="thinking"><CircleNotch className="spin" /> Preparing context</span>
                       ) : null}
                     </div>
+                    {message.role === "user" && messageIndex === lastUserIndex(messages) && !generating ? (
+                      <div className="message-actions">
+                        <button onClick={editLastPrompt}><PencilSimple /> Edit and resend</button>
+                      </div>
+                    ) : null}
                     {message.role === "assistant" && message.content ? (
                       <div className="message-actions">
                         <button onClick={() => void copyAnswer(message)} aria-label="Copy answer">
                           {copiedMessage === message.id ? <Check /> : <Copy />}
                           {copiedMessage === message.id ? "Copied" : "Copy"}
                         </button>
+                        {messageIndex === messages.length - 1 && !generating ? (
+                          <button onClick={regenerateLastResponse}><ArrowCounterClockwise /> Regenerate</button>
+                        ) : null}
                         {message.metrics.cache_hit ? <span>Cached response</span> : null}
                         {message.metrics.generation_tokens_per_second ? <span>{message.metrics.generation_tokens_per_second} tokens/sec</span> : null}
-                        {message.metrics.retrieval_ms ? <span>{Math.round(message.metrics.retrieval_ms)} ms retrieval</span> : null}
+                        {message.metrics.first_token_ms ? <span>{Math.round(message.metrics.first_token_ms)} ms first token</span> : null}
+                        {message.metrics.total_ms ? <span>{(message.metrics.total_ms / 1000).toFixed(1)} sec total</span> : null}
+                        {currentUser?.role === "admin" && message.metrics.retrieval_ms ? <span>{Math.round(message.metrics.retrieval_ms)} ms retrieval</span> : null}
                       </div>
                     ) : null}
                     {message.sources.length ? (
                       <div className="citation-row">
                         {message.sources.slice(0, 4).map((source) => (
                           <button key={source.id} onClick={() => setActiveSources(message.sources)}>
-                            {source.index} <span>{source.filename}</span>
+                            {source.index} <span>{source.filename} · p.{source.page_number || 1} · {Math.round(source.rerank_score * 100)}%</span>
                           </button>
                         ))}
                       </div>
@@ -691,8 +857,10 @@ function App() {
 
           <footer className="composer-wrap">
             {queuePosition > 0 ? <div className="queue-banner">Waiting in position {queuePosition}</div> : null}
+            {editingLastTurn ? <div className="edit-banner"><span>Editing your latest prompt</span><button onClick={() => { setEditingLastTurn(false); setPrompt(""); }}>Cancel</button></div> : null}
             <div className="composer">
               <textarea
+                ref={composerRef}
                 value={prompt}
                 onChange={(event) => setPrompt(event.target.value)}
                 onKeyDown={handleComposerKey}
@@ -712,6 +880,7 @@ function App() {
               )}
             </div>
             <p>Gemma can make mistakes. Check the cited source.</p>
+            <p className="shortcut-hint"><kbd>Ctrl</kbd> + <kbd>K</kbd> focus · <kbd>Ctrl</kbd> + <kbd>N</kbd> new chat</p>
           </footer>
         </main>
 
@@ -724,12 +893,14 @@ function App() {
             <div className="sources-list">
               {activeSources.map((source) => (
                 <article key={source.id}>
-                  <div className="source-title">
+                  <button className="source-summary" onClick={() => setExpandedSource(expandedSource === source.id ? null : source.id)} aria-expanded={expandedSource === source.id}>
                     <span>{source.index}</span>
-                    <div><strong>{source.filename}</strong><small>Page {source.page_number || 1}, chunk {source.chunk_index || source.index}</small></div>
-                  </div>
-                  <p>{source.quote}</p>
-                  <div className="source-score">Relevance {Math.round(source.rerank_score * 100)}%</div>
+                    <div><strong>{source.filename}</strong><small>Page {source.page_number || 1}{source.section_title ? ` · ${source.section_title}` : ""} · chunk {source.chunk_index || source.index}</small></div>
+                    <b>{Math.round(source.rerank_score * 100)}%</b>
+                  </button>
+                  {expandedSource === source.id ? (
+                    <div className="source-detail"><p>{source.quote}</p><div className="source-score">Relevance {Math.round(source.rerank_score * 100)}%</div></div>
+                  ) : null}
                 </article>
               ))}
             </div>
@@ -763,9 +934,20 @@ function App() {
           <Dialog.Title>Knowledge documents</Dialog.Title>
           <Dialog.Description size="2" mb="4">Upload a supported file to extract, embed, and index it.</Dialog.Description>
           <form className="upload-form" onSubmit={submitUpload}>
-            <label className="file-drop" htmlFor="document-file">
+            <label
+              className={`file-drop ${dragActive ? "drag-active" : ""}`}
+              htmlFor="document-file"
+              onDragOver={(event) => { event.preventDefault(); setDragActive(true); }}
+              onDragLeave={() => setDragActive(false)}
+              onDrop={(event) => {
+                event.preventDefault();
+                setDragActive(false);
+                const file = event.dataTransfer.files?.[0];
+                if (file) setUploadFile(file);
+              }}
+            >
               <FileArrowUp />
-              <strong>{uploadFile?.name || "Choose a document"}</strong>
+              <strong>{uploadFile?.name || "Drop a document here or choose a file"}</strong>
               <span>PDF, DOCX, XLSX, TXT, PNG or JPG up to 25 MB</span>
               <input id="document-file" type="file" accept=".pdf,.docx,.xlsx,.txt,.md,.csv,.json,.png,.jpg,.jpeg" onChange={(event) => setUploadFile(event.target.files?.[0] || null)} />
             </label>
@@ -784,21 +966,63 @@ function App() {
                 <div className="job-row" key={job.id}>
                   <div>
                     <strong>{job.source}</strong>
-                    <small>{job.status === "failed" ? job.error : `${job.phase}, ${job.progress}%`}</small>
+                    <small>{job.status === "failed" ? job.error : `${ingestionPhaseLabel(job.phase)}, ${job.progress}%`}</small>
                   </div>
                   <progress max="100" value={job.progress} aria-label={`${job.source} ingestion progress`} />
                 </div>
               ))}
             </div>
           ) : null}
+          <div className="document-tools">
+            <label className="compact-search">
+              <MagnifyingGlass aria-hidden="true" />
+              <input value={documentSearch} onChange={(event) => setDocumentSearch(event.target.value)} placeholder="Search documents" aria-label="Search documents" />
+            </label>
+            <Select.Root value={documentFilter} onValueChange={setDocumentFilter}>
+              <Select.Trigger aria-label="Filter document status" />
+              <Select.Content>
+                <Select.Item value="all">All statuses</Select.Item>
+                <Select.Item value="ready">Ready</Select.Item>
+                <Select.Item value="processing">Processing</Select.Item>
+                <Select.Item value="failed">Failed</Select.Item>
+              </Select.Content>
+            </Select.Root>
+          </div>
           <div className="document-list">
-            {documents.length ? documents.map((document) => (
+            {filteredDocuments.length ? filteredDocuments.map((document) => (
               <div key={document.id}>
                 <div className="document-icon"><Check weight="bold" /></div>
-                <span><strong>{document.source}</strong><small>{document.pages} pages, {document.chunks} chunks</small></span>
+                <span><strong>{document.source}</strong><small>{document.filename} · {document.pages} pages · {document.chunks} chunks</small></span>
                 <Badge color={document.status === "ready" ? "jade" : "amber"}>{document.status}</Badge>
+                <IconButton variant="ghost" color="red" aria-label={`Delete ${document.source}`} onClick={() => setDeleteTarget({ type: "document", id: document.id, name: document.source })}><Trash /></IconButton>
               </div>
-            )) : <div className="documents-empty">No indexed documents yet.</div>}
+            )) : <div className="documents-empty">No documents match the current filters.</div>}
+          </div>
+        </Dialog.Content>
+      </Dialog.Root>
+
+      <Dialog.Root open={Boolean(renameTarget)} onOpenChange={(open) => !open && setRenameTarget(null)}>
+        <Dialog.Content maxWidth="420px">
+          <Dialog.Title>Rename conversation</Dialog.Title>
+          <form onSubmit={saveConversationTitle} className="rename-form">
+            <TextField.Root value={renameTitle} onChange={(event) => setRenameTitle(event.target.value)} aria-label="Conversation title" autoFocus />
+            <div className="dialog-actions">
+              <Button type="button" variant="soft" color="gray" onClick={() => setRenameTarget(null)}>Cancel</Button>
+              <Button type="submit" disabled={!renameTitle.trim()}>Save name</Button>
+            </div>
+          </form>
+        </Dialog.Content>
+      </Dialog.Root>
+
+      <Dialog.Root open={Boolean(deleteTarget)} onOpenChange={(open) => !open && setDeleteTarget(null)}>
+        <Dialog.Content maxWidth="440px">
+          <Dialog.Title>Delete {deleteTarget?.type}</Dialog.Title>
+          <Dialog.Description size="2">
+            This will permanently delete “{deleteTarget?.name}”{deleteTarget?.type === "document" ? " and its indexed chunks" : ""}.
+          </Dialog.Description>
+          <div className="dialog-actions">
+            <Button variant="soft" color="gray" onClick={() => setDeleteTarget(null)}>Cancel</Button>
+            <Button color="red" onClick={() => void confirmDelete()}><Trash /> Delete</Button>
           </div>
         </Dialog.Content>
       </Dialog.Root>
@@ -810,22 +1034,38 @@ function App() {
               <Dialog.Title>Retrieval quality</Dialog.Title>
               <Dialog.Description size="2">Measure whether known questions retrieve the expected evidence.</Dialog.Description>
             </div>
-            <Button onClick={() => void runEvaluation()} disabled={evaluations.some((run) => run.status === "running")}>
-              <ChartLineUp /> Run evaluation
-            </Button>
+            <div className="evaluation-actions">
+              <Button variant="soft" onClick={() => void runEvaluation("baseline", false)} disabled={evaluations.some((run) => run.status === "running")}>
+                Baseline retrieval
+              </Button>
+              <Button onClick={() => void runEvaluation("upgraded", true)} disabled={evaluations.some((run) => run.status === "running")}>
+                <ChartLineUp /> Full upgraded test
+              </Button>
+            </div>
           </div>
           {evaluations.length ? evaluations.map((run) => (
             <section className="evaluation-run" key={run.id}>
               <div className="evaluation-meta">
-                <strong>{run.status === "running" ? `Testing ${run.completed} of ${run.total || "..."}` : "Completed evaluation"}</strong>
+                <strong>{run.status === "running" ? `Testing ${run.completed} of ${run.total || "..."}` : `${run.pipeline} · dataset ${run.dataset_version}`}</strong>
                 <Badge color={run.status === "ready" ? "jade" : run.status === "failed" ? "red" : "amber"}>{run.status}</Badge>
               </div>
               <div className="metric-grid">
                 <div><span>Top 1</span><strong>{Math.round(run.top1_rate * 100)}%</strong></div>
                 <div><span>Top 3</span><strong>{Math.round(run.top3_rate * 100)}%</strong></div>
+                <div><span>Top 5</span><strong>{Math.round(run.top5_rate * 100)}%</strong></div>
                 <div><span>Evidence</span><strong>{Math.round(run.evidence_rate * 100)}%</strong></div>
                 <div><span>MRR</span><strong>{run.mrr.toFixed(2)}</strong></div>
                 <div><span>Retrieval</span><strong>{Math.round(run.average_retrieval_ms)} ms</strong></div>
+                {run.include_generation ? <>
+                  <div><span>Citations</span><strong>{Math.round((run.citation_correctness || 0) * 100)}%</strong></div>
+                  <div><span>Grounded</span><strong>{Math.round((run.grounded_answer_rate || 0) * 100)}%</strong></div>
+                  <div><span>Unsupported</span><strong>{Math.round((run.unsupported_claim_rate || 0) * 100)}%</strong></div>
+                  <div><span>Refusals</span><strong>{Math.round((run.refusal_correctness || 0) * 100)}%</strong></div>
+                  <div><span>First token</span><strong>{Math.round(run.average_first_token_ms || 0)} ms</strong></div>
+                  <div><span>Total</span><strong>{((run.average_total_latency_ms || 0) / 1000).toFixed(1)} s</strong></div>
+                  <div><span>Generation</span><strong>{(run.average_generation_tps || 0).toFixed(1)} tok/s</strong></div>
+                  <div><span>Cache hits</span><strong>{Math.round((run.cache_hit_rate || 0) * 100)}%</strong></div>
+                </> : null}
               </div>
               {run.status === "running" && run.total ? <progress max={run.total} value={run.completed} aria-label="Evaluation progress" /> : null}
               {run.error ? <p className="inline-error">{run.error}</p> : null}

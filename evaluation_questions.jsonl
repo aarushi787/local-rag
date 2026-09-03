@@ -1,20 +1,21 @@
-{"question":"What is the workflow for producing a grounded answer?","expected_source":"Local LLMs for RAG","expected_terms":["vector search","reranking"]}
-{"question":"Which OCR model is the primary OCR model?","expected_source":"Local LLMs for RAG","expected_terms":["PaddleOCR-VL"]}
-{"question":"What does PaddleOCR-VL produce from scanned pages?","expected_source":"Local LLMs for RAG","expected_terms":["Markdown"]}
-{"question":"Which model turns text into vectors?","expected_source":"Local LLMs for RAG","expected_terms":["bge-m3"]}
-{"question":"How many parameters does bge-m3 have?","expected_source":"Local LLMs for RAG","expected_terms":["0.57B"]}
-{"question":"Which model reranks retrieved search results?","expected_source":"Local LLMs for RAG","expected_terms":["bge-reranker-v2-m3"]}
-{"question":"What is the purpose of the vector database?","expected_source":"Local LLMs for RAG","expected_terms":["Similarity search"]}
-{"question":"Which model writes the final answer?","expected_source":"Local LLMs for RAG","expected_terms":["Qwen3-8B"]}
-{"question":"What quantization is shown for Qwen3-8B?","expected_source":"Local LLMs for RAG","expected_terms":["AWQ 4-bit"]}
-{"question":"How much storage does Qwen3-8B require?","expected_source":"Local LLMs for RAG","expected_terms":["6 GB"]}
-{"question":"What is the estimated VRAM for Qwen3-8B?","expected_source":"Local LLMs for RAG","expected_terms":["7 GB"]}
-{"question":"Which optional backup OCR model is listed?","expected_source":"Local LLMs for RAG","expected_terms":["DeepSeek-OCR"]}
-{"question":"How many parameters does DeepSeek-OCR have?","expected_source":"Local LLMs for RAG","expected_terms":["3B"]}
-{"question":"What is DeepSeek-OCR intended for?","expected_source":"Local LLMs for RAG","expected_terms":["bulk processing"]}
-{"question":"What is the base stack storage estimate?","expected_source":"Local LLMs for RAG","expected_terms":["12.6 GB"]}
-{"question":"What peak VRAM is estimated with sequential GPU loading?","expected_source":"Local LLMs for RAG","expected_terms":["7 GB"]}
-{"question":"What storage is estimated when optional DeepSeek-OCR is included?","expected_source":"Local LLMs for RAG","expected_terms":["19.6 GB"]}
-{"question":"What peak VRAM is estimated with DeepSeek-OCR?","expected_source":"Local LLMs for RAG","expected_terms":["8 GB"]}
-{"question":"What assumption is made about model loading for peak VRAM?","expected_source":"Local LLMs for RAG","expected_terms":["one model is loaded at a time"]}
-{"question":"What extra deployment behavior requires additional memory?","expected_source":"Local LLMs for RAG","expected_terms":["concurrent deployment","framework overhead"]}
+{"dataset_version":"rag-workflow-v1","question":"What is the workflow for producing a grounded answer?","expected_document":"Local LLMs for RAG","expected_page":1,"expected_section":null,"required_facts":["vector search","reranking"],"should_refuse":false}
+{"dataset_version":"rag-workflow-v1","question":"Which OCR model is the primary OCR model?","expected_document":"Local LLMs for RAG","expected_page":1,"expected_section":null,"required_facts":["PaddleOCR-VL"],"should_refuse":false}
+{"dataset_version":"rag-workflow-v1","question":"What does PaddleOCR-VL produce from scanned pages?","expected_document":"Local LLMs for RAG","expected_page":1,"expected_section":null,"required_facts":["Markdown"],"should_refuse":false}
+{"dataset_version":"rag-workflow-v1","question":"Which model turns text into vectors?","expected_document":"Local LLMs for RAG","expected_page":1,"expected_section":null,"required_facts":["bge-m3"],"should_refuse":false}
+{"dataset_version":"rag-workflow-v1","question":"How many parameters does bge-m3 have?","expected_document":"Local LLMs for RAG","expected_page":1,"expected_section":null,"required_facts":["0.57B"],"should_refuse":false}
+{"dataset_version":"rag-workflow-v1","question":"Which model reranks retrieved search results?","expected_document":"Local LLMs for RAG","expected_page":1,"expected_section":null,"required_facts":["bge-reranker-v2-m3"],"should_refuse":false}
+{"dataset_version":"rag-workflow-v1","question":"What is the purpose of the vector database?","expected_document":"Local LLMs for RAG","expected_page":1,"expected_section":null,"required_facts":["Similarity search"],"should_refuse":false}
+{"dataset_version":"rag-workflow-v1","question":"Which model writes the final answer?","expected_document":"Local LLMs for RAG","expected_page":1,"expected_section":null,"required_facts":["Qwen3-8B"],"should_refuse":false}
+{"dataset_version":"rag-workflow-v1","question":"What quantization is shown for Qwen3-8B?","expected_document":"Local LLMs for RAG","expected_page":1,"expected_section":null,"required_facts":["AWQ 4-bit"],"should_refuse":false}
+{"dataset_version":"rag-workflow-v1","question":"How much storage does Qwen3-8B require?","expected_document":"Local LLMs for RAG","expected_page":1,"expected_section":null,"required_facts":["6 GB"],"should_refuse":false}
+{"dataset_version":"rag-workflow-v1","question":"What is the estimated VRAM for Qwen3-8B?","expected_document":"Local LLMs for RAG","expected_page":1,"expected_section":null,"required_facts":["7 GB"],"should_refuse":false}
+{"dataset_version":"rag-workflow-v1","question":"Which optional backup OCR model is listed?","expected_document":"Local LLMs for RAG","expected_page":1,"expected_section":null,"required_facts":["DeepSeek-OCR"],"should_refuse":false}
+{"dataset_version":"rag-workflow-v1","question":"How many parameters does DeepSeek-OCR have?","expected_document":"Local LLMs for RAG","expected_page":1,"expected_section":null,"required_facts":["3B"],"should_refuse":false}
+{"dataset_version":"rag-workflow-v1","question":"What is DeepSeek-OCR intended for?","expected_document":"Local LLMs for RAG","expected_page":1,"expected_section":null,"required_facts":["bulk processing"],"should_refuse":false}
+{"dataset_version":"rag-workflow-v1","question":"What is the base stack storage estimate?","expected_document":"Local LLMs for RAG","expected_page":1,"expected_section":null,"required_facts":["12.6 GB"],"should_refuse":false}
+{"dataset_version":"rag-workflow-v1","question":"What peak VRAM is estimated with sequential GPU loading?","expected_document":"Local LLMs for RAG","expected_page":1,"expected_section":null,"required_facts":["7 GB"],"should_refuse":false}
+{"dataset_version":"rag-workflow-v1","question":"What storage is estimated when optional DeepSeek-OCR is included?","expected_document":"Local LLMs for RAG","expected_page":1,"expected_section":null,"required_facts":["19.6 GB"],"should_refuse":false}
+{"dataset_version":"rag-workflow-v1","question":"What peak VRAM is estimated with DeepSeek-OCR?","expected_document":"Local LLMs for RAG","expected_page":1,"expected_section":null,"required_facts":["8 GB"],"should_refuse":false}
+{"dataset_version":"rag-workflow-v1","question":"What assumption is made about model loading for peak VRAM?","expected_document":"Local LLMs for RAG","expected_page":1,"expected_section":null,"required_facts":["one model is loaded at a time"],"should_refuse":false}
+{"dataset_version":"rag-workflow-v1","question":"What extra deployment behavior requires additional memory?","expected_document":"Local LLMs for RAG","expected_page":1,"expected_section":null,"required_facts":["concurrent deployment","framework overhead"],"should_refuse":false}
+{"dataset_version":"rag-workflow-v1","question":"What is the office Wi-Fi password?","expected_document":"No supporting document","expected_page":null,"expected_section":null,"required_facts":[],"should_refuse":true}

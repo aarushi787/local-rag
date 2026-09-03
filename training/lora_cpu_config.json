@@ -1,0 +1,25 @@
+{
+  "base_model": "google/gemma-3-1b-it",
+  "dataset_directory": "training-data/reviewed",
+  "output_directory": "training-output/gemma-3-1b-rag-lora",
+  "max_sequence_length": 384,
+  "epochs": 1,
+  "per_device_train_batch_size": 1,
+  "gradient_accumulation_steps": 16,
+  "learning_rate": 0.0002,
+  "use_cpu": true,
+  "gradient_checkpointing": true,
+  "lora": {
+    "rank": 8,
+    "alpha": 16,
+    "dropout": 0.05,
+    "bias": "none",
+    "target_modules": [
+      "q_proj",
+      "k_proj",
+      "v_proj",
+      "o_proj"
+    ]
+  }
+}
+

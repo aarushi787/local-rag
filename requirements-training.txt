@@ -1,0 +1,8 @@
+# Optional only. Do not install these in the production .venv-rag environment.
+torch>=2.6
+transformers>=4.53
+datasets>=3.5
+peft>=0.15
+accelerate>=1.5
+trl>=0.16
+

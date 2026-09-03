@@ -6,6 +6,7 @@ export type Source = {
   filename: string;
   page_number?: number | null;
   chunk_index?: number | null;
+  section_title?: string | null;
   bbox?: number[] | null;
   similarity: number;
   rerank_score: number;
@@ -53,6 +54,7 @@ export type ConversationSummary = {
   created_at: string;
   updated_at: string;
   message_count: number;
+  training_approved?: boolean;
 };
 
 export type StoredMessage = {
@@ -101,9 +103,21 @@ export type EvaluationRun = {
   completed: number;
   top1_rate: number;
   top3_rate: number;
+  top5_rate: number;
   evidence_rate: number;
   mrr: number;
   average_retrieval_ms: number;
+  dataset_version: string;
+  pipeline: "baseline" | "upgraded";
+  include_generation: boolean;
+  citation_correctness?: number | null;
+  grounded_answer_rate?: number | null;
+  unsupported_claim_rate?: number | null;
+  refusal_correctness?: number | null;
+  average_first_token_ms?: number | null;
+  average_total_latency_ms?: number | null;
+  average_generation_tps?: number | null;
+  cache_hit_rate?: number | null;
   error?: string | null;
   created_at: string;
   finished_at?: string | null;
@@ -201,8 +215,13 @@ export async function getEvaluations(): Promise<EvaluationRun[]> {
   return payload.data;
 }
 
-export const startEvaluation = () =>
-  requestJson<{ id: string; status: string }>("/v1/evaluations", { method: "POST" });
+export const startEvaluation = (
+  pipeline: "baseline" | "upgraded" = "upgraded",
+  includeGeneration = false
+) => requestJson<{ id: string; status: string; pipeline: string }>("/v1/evaluations", {
+  method: "POST",
+  body: JSON.stringify({ pipeline, include_generation: includeGeneration })
+});
 
 export async function getUsers(): Promise<UserRecord[]> {
   const payload = await requestJson<{ data: UserRecord[] }>("/v1/users");
@@ -232,10 +251,25 @@ export const getConversation = (id: string) =>
 export const deleteConversation = (id: string) =>
   requestJson<{ deleted: boolean }>(`/v1/conversations/${id}`, { method: "DELETE" });
 
+export const renameConversation = (id: string, title: string) =>
+  requestJson<ConversationSummary>(`/v1/conversations/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify({ title })
+  });
+
+export const setConversationTrainingApproval = (id: string, approved: boolean) =>
+  requestJson<{ id: string; title: string; training_approved: boolean }>(
+    `/v1/conversations/${id}/training-approval`,
+    { method: "PUT", body: JSON.stringify({ approved }) }
+  );
+
 export async function getDocuments(): Promise<DocumentRecord[]> {
   const payload = await requestJson<{ data: DocumentRecord[] }>("/v1/documents");
   return payload.data;
 }
+
+export const deleteDocument = (id: string) =>
+  requestJson<{ deleted: boolean }>(`/v1/documents/${id}`, { method: "DELETE" });
 
 export function uploadDocument(file: File, source: string): Promise<IngestionJob> {
   const form = new FormData();
@@ -263,6 +297,7 @@ export async function streamChat(
     profile?: "auto" | "fast" | "balanced" | "quality";
     stream: true;
     max_tokens: number;
+    replace_last?: boolean;
   },
   callbacks: StreamCallbacks,
   signal: AbortSignal

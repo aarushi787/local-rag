@@ -5,10 +5,14 @@ from __future__ import annotations
 import unittest
 import tempfile
 import zipfile
+import uuid
+from contextlib import contextmanager
 from io import BytesIO
 from pathlib import Path
+from unittest.mock import patch
 
 import app
+import export_lora_dataset as lora_export
 from fastapi import HTTPException
 from fastapi.responses import JSONResponse
 from starlette.requests import Request
@@ -375,6 +379,199 @@ class ProductionBoundaryTests(unittest.TestCase):
         finally:
             app.API_KEY = original_key
             app.REQUIRE_API_KEY = original_required
+
+    def test_non_admin_is_rejected_from_admin_routes(self) -> None:
+        with self.assertRaises(HTTPException) as raised:
+            app.require_admin(app.Principal(uuid.uuid4(), "Reader", "user"))
+        self.assertEqual(raised.exception.status_code, 403)
+
+
+class RagSecurityAndBehaviorTests(unittest.TestCase):
+    def test_retrieval_filters_permissions_inside_sql(self) -> None:
+        statements: list[tuple[str, object]] = []
+
+        class Cursor:
+            def fetchall(self):
+                return []
+
+        class Connection:
+            def execute(self, sql, params=None):
+                statements.append((sql, params))
+                return Cursor()
+
+        @contextmanager
+        def fake_connection():
+            yield Connection()
+
+        principal = app.Principal(uuid.uuid4(), "Restricted user", "user")
+        with patch.object(app, "db_connection", fake_connection), patch.object(
+            app, "cached_query_embedding", return_value=tuple([0.0] * 768)
+        ):
+            self.assertEqual(app.retrieve("policy", principal=principal), [])
+        sql = "\n".join(statement for statement, _ in statements)
+        self.assertIn("rag_document_permissions", sql)
+        self.assertIn("permission.user_id", sql)
+        self.assertTrue(any(params and params.get("user_id") == principal.id for _, params in statements))
+
+    def test_cache_key_changes_when_document_checksum_changes(self) -> None:
+        class Cursor:
+            def __init__(self, checksum):
+                self.checksum = checksum
+
+            def fetchall(self):
+                return [(self.checksum,)]
+
+        class Connection:
+            def __init__(self, checksum):
+                self.checksum = checksum
+
+            def execute(self, _sql, _params=None):
+                return Cursor(self.checksum)
+
+        def connection_for(checksum):
+            @contextmanager
+            def connection():
+                yield Connection(checksum)
+            return connection
+
+        request = app.ChatCompletionRequest(
+            messages=[app.ChatMessage(role="user", content="What is the policy?")]
+        )
+        settings = app.response_settings(request)
+        principal = app.Principal(uuid.uuid4(), "Reader", "user")
+        with patch.object(app, "db_connection", connection_for("a" * 64)):
+            first = app.cache_identity(request, "What is the policy?", settings, principal)
+        with patch.object(app, "db_connection", connection_for("b" * 64)):
+            second = app.cache_identity(request, "What is the policy?", settings, principal)
+        self.assertNotEqual(first, second)
+
+    def test_cached_stream_has_tokens_sources_metrics_and_done_marker(self) -> None:
+        request = app.ChatCompletionRequest(
+            messages=[app.ChatMessage(role="user", content="Which model?")],
+            stream=True,
+            save=False,
+        )
+        cached = {
+            "answer": "Gemma [Source 1]",
+            "sources": [{"index": 1, "id": 9, "filename": "guide.pdf"}],
+            "metrics": {"cache_hit": True},
+        }
+        principal = app.Principal(uuid.uuid4(), "Reader", "user")
+        with patch.object(app, "cache_identity", return_value=("key", "fingerprint")), patch.object(
+            app, "get_cached_answer", return_value=cached
+        ):
+            stream = "".join(app.streaming_chat(request, principal))
+        self.assertIn("Gemma [Source 1]", stream)
+        self.assertIn('"cache_hit": true', stream)
+        self.assertIn("guide.pdf", stream)
+        self.assertTrue(stream.endswith("data: [DONE]\n\n"))
+
+    def test_citation_and_refusal_scoring(self) -> None:
+        grounded = app.score_generated_answer(
+            {"required_facts": ["7 GB"], "should_refuse": False},
+            "Peak memory is 7 GB [Source 1].",
+            [{"index": 1}],
+        )
+        self.assertTrue(grounded["citation_correct"])
+        self.assertTrue(grounded["grounded"])
+        refusal = app.score_generated_answer(
+            {"required_facts": [], "should_refuse": True},
+            "I don't know from the supplied documents.",
+            [],
+        )
+        self.assertTrue(refusal["refusal_correct"])
+
+    def test_replace_last_removes_previous_exchange_before_insert(self) -> None:
+        statements: list[str] = []
+
+        class Cursor:
+            def fetchone(self):
+                return (1,)
+
+        class Connection:
+            def execute(self, sql, _params=None):
+                statements.append(sql)
+                return Cursor()
+
+        @contextmanager
+        def fake_connection():
+            yield Connection()
+
+        conversation_id = uuid.uuid4()
+        request = app.ChatCompletionRequest(
+            messages=[app.ChatMessage(role="user", content="Edited question")],
+            conversation_id=conversation_id,
+            replace_last=True,
+        )
+        with patch.object(app, "db_connection", fake_connection):
+            self.assertEqual(
+                app.prepare_conversation(request, "Edited question"), conversation_id
+            )
+        delete_index = next(index for index, sql in enumerate(statements) if "DELETE FROM rag_messages" in sql)
+        insert_index = next(index for index, sql in enumerate(statements) if "INSERT INTO rag_messages" in sql)
+        self.assertLess(delete_index, insert_index)
+
+    def test_retrieval_scoring_honors_document_and_page(self) -> None:
+        score = app.score_retrieval(
+            {
+                "expected_document": "policy.pdf",
+                "expected_page": 12,
+                "required_facts": ["annual leave"],
+            },
+            [{"source": "policy.pdf", "filename": "policy.pdf", "page_number": 12,
+              "section_title": "Leave", "content": "Annual leave is available."}],
+        )
+        self.assertTrue(score["top1"])
+        self.assertTrue(score["evidence"])
+
+    def test_ingestion_progress_records_phase_and_percentage(self) -> None:
+        executed: list[tuple[str, tuple]] = []
+
+        class Connection:
+            def execute(self, sql, params=None):
+                executed.append((sql, params))
+
+        @contextmanager
+        def fake_connection():
+            yield Connection()
+
+        job_id = uuid.uuid4()
+        with patch.object(app, "db_connection", fake_connection):
+            app.update_ingestion_job(job_id, "embedding", 72)
+        self.assertEqual(executed[0][1], ("embedding", 72, 72, job_id))
+
+    def test_training_export_redacts_credentials_and_personal_data(self) -> None:
+        value = lora_export.redact(
+            "Email person@example.com api_key=secret-value and call +1 202 555 0198",
+            ["Private Name"],
+        )
+        self.assertNotIn("person@example.com", value)
+        self.assertNotIn("secret-value", value)
+        self.assertNotIn("555", value)
+
+    def test_training_split_is_deterministic_and_held_out(self) -> None:
+        records = [{"id": str(index), "messages": []} for index in range(10)]
+        first = lora_export.split_records(records, 42)
+        second = lora_export.split_records(records, 42)
+        self.assertEqual(first, second)
+        self.assertGreaterEqual(len(first["validation"]), 1)
+        self.assertGreaterEqual(len(first["test"]), 1)
+
+    def test_evaluation_payload_reports_all_quality_metrics(self) -> None:
+        from datetime import datetime, timezone
+
+        now = datetime.now(timezone.utc)
+        payload = app.evaluation_payload(
+            (
+                uuid.uuid4(), "ready", 10, 10, 8, 9, 10, 8, 0.82, 45.0,
+                "dataset-v1", "upgraded", True, 8, 7, 1, 9, 10,
+                1200.0, 20000.0, 75.0, 2, None, now, now,
+            )
+        )
+        self.assertEqual(payload["top5_rate"], 1.0)
+        self.assertEqual(payload["citation_correctness"], 0.8)
+        self.assertEqual(payload["unsupported_claim_rate"], 0.1)
+        self.assertEqual(payload["cache_hit_rate"], 0.2)
 
 
 if __name__ == "__main__":

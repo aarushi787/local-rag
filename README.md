@@ -87,10 +87,12 @@ secondary laptop. The browser keeps the API key in session storage and clears
 it when that browser session ends. The server address is stored locally on that
 device.
 
-The frontend renders streamed Markdown, citations, retrieval and generation
-metrics, server health, document counts, model profiles, saved conversations,
-uploads, evaluations, and per-user access controls. It adapts to desktop,
-tablet, and phone layouts and supports light and dark themes.
+The frontend renders token-by-token Markdown and expandable citations with
+filename, page, and relevance. It supports stop, regenerate, edit-and-resend,
+copy, conversation search/rename/delete/export, drag-and-drop uploads, ingestion
+progress, document search/filter/delete, response profiles, component status,
+latency metrics, keyboard shortcuts, per-user access, and light/dark responsive
+layouts. Retrieval internals and the evaluation dashboard remain administrator-only.
 
 ## Build or deploy the frontend
 
@@ -262,13 +264,16 @@ $response.metrics | Format-List
 Each source includes the document ID, filename, page number, chunk number,
 bounding box when available, a supporting quote, similarity, and rerank score.
 
-## Run retrieval evaluation
+## Run retrieval and answer-quality evaluation
 
-The included dataset has 20 questions for the existing `Local LLMs for RAG`
-document. It measures source hit rate, evidence hit rate, and reciprocal rank.
+The versioned dataset contains expected documents, pages or sections, required
+facts, and refusal expectations. It measures Recall@1/3/5, MRR, evidence hits,
+citations, grounded answers, unsupported claims, refusals, latency, generation
+speed, and cache hits.
 
 ```powershell
-python .\evaluate_retrieval.py
+python .\evaluate_retrieval.py --pipeline upgraded
+python .\evaluate_retrieval.py --pipeline baseline
 ```
 
 For a quick smoke test:
@@ -281,9 +286,30 @@ Edit `evaluation_questions.jsonl` as real company documents are added. Expected
 sources and evidence terms should be verified by a person, not generated from
 the model's answers.
 
-Administrators can also open **Evaluations** in the interface, start the suite
-in the background, and inspect Top 1, Top 3, evidence hit rate, MRR, latency,
-progress, and per-question results.
+Administrators can open **Evaluations** in the interface and run the retained
+semantic-only baseline or the complete upgraded pipeline against exactly the
+same questions. The full upgraded run generates answers and is deliberately
+slow on CPU.
+
+## Customize Gemma safely
+
+The recommended prompt-only profile is in `models\Modelfile.gemma-rag`:
+
+```powershell
+$env:OLLAMA_HOST = "127.0.0.1:8080"
+ollama create local-rag-gemma -f .\models\Modelfile.gemma-rag
+```
+
+This profile uses the installed Gemma model, a 2048-token context, low
+temperature, citation rules, and explicit insufficient-evidence refusal. It does
+not modify model weights.
+
+Optional LoRA preparation is documented in `training\README.md`. Only
+administrator-approved conversations can be exported. The export pipeline
+redacts common credentials and personal identifiers and creates deterministic
+train, validation, and held-out test JSONL files for mandatory human review.
+Training is never started automatically and must use the original
+`google/gemma-3-1b-it` checkpoint, not an Ollama Q4/QAT model.
 
 ## Benchmark response modes
 
@@ -419,14 +445,15 @@ and rate-limits `/v1` traffic without storing or logging raw API keys. Avoid
 - `GET /v1/queue` — current inference workload
 - `POST /v1/chat/cancel/{request_id}` — stop an active or waiting generation
 - `GET/POST /v1/conversations` — list or create saved conversations
-- `GET/DELETE /v1/conversations/{id}` — read or remove a conversation
+- `GET/PATCH/DELETE /v1/conversations/{id}` — read, rename, or remove a conversation
+- `PUT /v1/conversations/{id}/training-approval` — approve export (administrator only)
 - `GET /v1/documents` — document inventory and ingestion status
 - `POST /v1/documents` — ingest supplied plain text
 - `POST /v1/documents/upload` — automatically process supported files
 - `PUT /v1/documents/{id}/permissions` — grant document access
 - `DELETE /v1/documents/{id}` — remove a document and its chunks
 - `GET/POST /v1/ingestion-jobs` — inspect or create background ingestion jobs
-- `GET/POST /v1/evaluations` — inspect or start retrieval evaluations
+- `GET/POST /v1/evaluations` — inspect or start baseline/upgraded evaluations
 - `POST /v1/chat/completions` — hybrid RAG chat with optional SSE streaming
 
 `POST /v1/chat/completions` also accepts optional `profile` and `document_id`
@@ -442,3 +469,6 @@ Gemma generator stay resident together on a 32 GB machine. Neon connections
 are pooled, recent chat history is bounded for the 2K prompt context, and model
 weights remain loaded for 30 minutes after use. The first request after a full
 Ollama restart is a cold start; following requests are substantially faster.
+Neon startup uses bounded retries and pool reconnection, ingestion is restricted
+to a bounded single-worker lane by default, and logs are structured JSON without
+request bodies or document content.
