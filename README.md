@@ -81,8 +81,37 @@ file, which is excluded by `.gitignore`.
 
 Open the interactive documentation at <http://127.0.0.1:8000/docs>.
 Open the chat interface at <http://127.0.0.1:8000/>. On first use, paste the
-same `RAG_API_KEY` into the Connection dialog. The browser keeps it in session
-storage and clears it when that browser session ends.
+same `RAG_API_KEY` into the Connection dialog. The dialog also accepts a
+different HTTPS server address, which lets one deployed frontend connect to a
+secondary laptop. The browser keeps the API key in session storage and clears
+it when that browser session ends. The server address is stored locally on that
+device.
+
+The frontend renders streamed Markdown, citations, retrieval and generation
+metrics, server health, document counts, model profiles, saved conversations,
+uploads, evaluations, and per-user access controls. It adapts to desktop,
+tablet, and phone layouts and supports light and dark themes.
+
+## Build or deploy the frontend
+
+For the simplest private deployment, let FastAPI serve `frontend/dist` and use
+the Tailscale HTTPS address described below. This keeps the webpage and API on
+the same origin and requires no separate frontend host.
+
+To rebuild after frontend changes:
+
+```powershell
+Set-Location .\frontend
+npm.cmd install
+npm.cmd run build
+Set-Location ..
+```
+
+For separate static hosting, optionally set `VITE_API_URL` before building, or
+enter the server address at runtime in the Connection dialog. Add the exact
+frontend HTTPS origin to `ALLOWED_ORIGINS` in the server `.env`. Never place
+`DATABASE_URL` or `RAG_API_KEY` in `VITE_*` variables because those values are
+visible in the browser bundle.
 
 For later starts, create `.env` from `.env.example`. Replace the complete
 example `DATABASE_URL` value with the pooled connection string shown by Neon

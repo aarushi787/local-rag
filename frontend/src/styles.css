@@ -15,6 +15,10 @@ body,
   margin: 0;
 }
 
+body {
+  overflow: hidden;
+}
+
 button,
 textarea,
 input {
@@ -269,6 +273,28 @@ button {
   font-size: 12px;
 }
 
+.server-state > span:not(.status-dot) {
+  display: grid;
+  flex: 1;
+  gap: 2px;
+  min-width: 0;
+}
+
+.server-state strong {
+  color: var(--text-main);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.server-state small {
+  overflow: hidden;
+  color: var(--text-muted);
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .status-dot {
   width: 7px;
   height: 7px;
@@ -370,8 +396,13 @@ button {
   place-items: center;
   align-content: center;
   min-height: 100%;
-  padding: 52px 24px 100px;
+  padding: 46px 24px 90px;
   text-align: center;
+}
+
+.workspace-intro {
+  display: grid;
+  justify-items: center;
 }
 
 .empty-symbol {
@@ -391,7 +422,7 @@ button {
   line-height: 1.08;
 }
 
-.empty-chat > p {
+.workspace-intro > p {
   max-width: 560px;
   margin: 14px 0 26px;
   color: var(--text-muted);
@@ -399,16 +430,66 @@ button {
   line-height: 1.6;
 }
 
+.workspace-overview {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  width: min(720px, 100%);
+  margin-bottom: 14px;
+  overflow: hidden;
+  border: 1px solid var(--border-soft);
+  border-radius: 14px;
+  background: var(--surface-raised);
+}
+
+.workspace-overview > div {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding: 13px 15px;
+  border-right: 1px solid var(--border-soft);
+  text-align: left;
+}
+
+.workspace-overview > div:last-child {
+  border-right: 0;
+}
+
+.workspace-overview svg {
+  flex: 0 0 auto;
+  color: var(--accent-strong);
+  font-size: 18px;
+}
+
+.workspace-overview span {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.workspace-overview strong {
+  overflow: hidden;
+  color: var(--text-main);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .suggestions {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 10px;
   width: min(720px, 100%);
 }
 
 .suggestions button {
-  min-height: 72px;
-  padding: 14px;
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  min-height: 58px;
+  padding: 13px 15px;
   border: 1px solid var(--border-soft);
   border-radius: 12px;
   background: var(--surface-raised);
@@ -416,6 +497,12 @@ button {
   font-size: 13px;
   line-height: 1.4;
   text-align: left;
+}
+
+.suggestions button svg {
+  flex: 0 0 auto;
+  color: var(--accent-strong);
+  font-size: 18px;
 }
 
 .suggestions button:hover {
@@ -432,6 +519,21 @@ button {
 .message {
   padding: 22px 0;
   border-bottom: 1px solid var(--border-soft);
+}
+
+.message.user {
+  width: fit-content;
+  max-width: 78%;
+  margin: 10px 0 10px auto;
+  padding: 13px 16px;
+  border: 1px solid var(--border-soft);
+  border-radius: 14px;
+  background: var(--surface-raised);
+}
+
+.message.user .message-author {
+  margin-bottom: 5px;
+  text-align: right;
 }
 
 .message:last-of-type {
@@ -454,7 +556,105 @@ button {
 .message-content {
   font-size: 15px;
   line-height: 1.72;
+}
+
+.message-plain {
   white-space: pre-wrap;
+}
+
+.message-content > :first-child {
+  margin-top: 0;
+}
+
+.message-content > :last-child {
+  margin-bottom: 0;
+}
+
+.message-content p,
+.message-content ul,
+.message-content ol,
+.message-content pre,
+.message-content table,
+.message-content blockquote {
+  margin: 0 0 12px;
+}
+
+.message-content ul,
+.message-content ol {
+  padding-left: 22px;
+}
+
+.message-content li + li {
+  margin-top: 5px;
+}
+
+.message-content code {
+  padding: 2px 5px;
+  border-radius: 6px;
+  background: var(--panel-bg);
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 0.88em;
+}
+
+.message-content pre {
+  overflow-x: auto;
+  padding: 14px;
+  border: 1px solid var(--border-soft);
+  border-radius: 12px;
+  background: var(--panel-bg);
+}
+
+.message-content pre code {
+  padding: 0;
+  background: transparent;
+}
+
+.message-content table {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+  border-collapse: collapse;
+}
+
+.message-content th,
+.message-content td {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border-soft);
+  text-align: left;
+  white-space: nowrap;
+}
+
+.message-content blockquote {
+  padding-left: 14px;
+  border-left: 3px solid var(--accent);
+  color: var(--text-muted);
+}
+
+.message-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 12px;
+  margin-top: 13px;
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.message-actions button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 7px;
+  border: 0;
+  border-radius: 7px;
+  color: var(--text-muted);
+  background: transparent;
+  cursor: pointer;
+}
+
+.message-actions button:hover {
+  color: var(--text-main);
+  background: var(--panel-bg);
 }
 
 .thinking {
@@ -685,6 +885,20 @@ button {
   color: var(--text-muted);
   font-size: 12px;
   font-weight: 650;
+}
+
+.field-help {
+  margin: 6px 0 15px;
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+button:focus-visible,
+textarea:focus-visible,
+input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 .dialog-actions {
@@ -1066,7 +1280,23 @@ progress::-webkit-progress-value {
 
   .empty-chat {
     align-content: start;
-    padding-top: 14vh;
+    padding-top: 8vh;
+  }
+
+  .workspace-overview {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .workspace-overview > div:nth-child(2) {
+    border-right: 0;
+  }
+
+  .workspace-overview > div:nth-child(-n + 2) {
+    border-bottom: 1px solid var(--border-soft);
+  }
+
+  .message.user {
+    max-width: 92%;
   }
 
   .message-list {

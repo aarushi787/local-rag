@@ -1,12 +1,14 @@
-import { FormEvent, KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, KeyboardEvent, lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowUp,
   Books,
   ChatCircle,
   ChartLineUp,
   Check,
+  CheckCircle,
   CircleNotch,
   Copy,
+  Database,
   FileArrowUp,
   FileText,
   Gear,
@@ -56,7 +58,10 @@ import {
   EvaluationRun,
   IngestionJob,
   Source,
+  displayApiUrl,
+  storedApiUrl,
   storedApiKey,
+  storeApiUrl,
   storeApiKey,
   startEvaluation,
   setDocumentPermission,
@@ -75,6 +80,7 @@ type UiMessage = {
 };
 
 const makeId = () => crypto.randomUUID();
+const MarkdownContent = lazy(() => import("./MarkdownContent"));
 
 function App() {
   const [theme, setTheme] = useState<"light" | "dark">(() => {
@@ -108,6 +114,9 @@ function App() {
   const [securityOpen, setSecurityOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [apiKeyInput, setApiKeyInput] = useState(storedApiKey());
+  const [apiUrlInput, setApiUrlInput] = useState(displayApiUrl());
+  const [connecting, setConnecting] = useState(false);
+  const [copiedMessage, setCopiedMessage] = useState<string | null>(null);
   const [uploadFile, setUploadFile] = useState<File | null>(null);
   const [uploadSource, setUploadSource] = useState("");
   const [uploading, setUploading] = useState(false);
@@ -118,8 +127,17 @@ function App() {
   const [permissionDocument, setPermissionDocument] = useState("");
   const abortRef = useRef<AbortController | null>(null);
   const endRef = useRef<HTMLDivElement>(null);
+  const copyTimerRef = useRef<number | null>(null);
 
   const isHealthy = health?.status === "healthy";
+  const connectedServer = storedApiUrl() || window.location.origin;
+  const serverHost = (() => {
+    try {
+      return new URL(connectedServer).host;
+    } catch {
+      return connectedServer;
+    }
+  })();
   const latestMetrics = useMemo(
     () => [...messages].reverse().find((message) => message.role === "assistant")?.metrics,
     [messages]
@@ -128,6 +146,10 @@ function App() {
   useEffect(() => {
     localStorage.setItem("local-rag-theme", theme);
   }, [theme]);
+
+  useEffect(() => () => {
+    if (copyTimerRef.current) window.clearTimeout(copyTimerRef.current);
+  }, []);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: generating ? "auto" : "smooth" });
@@ -191,11 +213,34 @@ function App() {
     return () => window.clearInterval(timer);
   }, [ingestionJobs, evaluations]);
 
-  const saveKey = () => {
+  const saveConnection = async () => {
+    const address = apiUrlInput.trim().replace(/\/$/, "");
+    if (address && !/^https?:\/\//i.test(address)) {
+      setError("Server address must start with http:// or https://.");
+      return;
+    }
+    storeApiUrl(address === window.location.origin ? "" : address);
     storeApiKey(apiKeyInput.trim());
-    setSettingsOpen(false);
+    setConnecting(true);
     setError("");
-    void refreshWorkspace();
+    try {
+      const status = await getHealth();
+      await getCurrentUser();
+      setHealth(status);
+      await refreshWorkspace();
+      setSettingsOpen(false);
+    } catch (caught) {
+      handleApiError(caught);
+    } finally {
+      setConnecting(false);
+    }
+  };
+
+  const copyAnswer = async (message: UiMessage) => {
+    await navigator.clipboard.writeText(message.content);
+    setCopiedMessage(message.id);
+    if (copyTimerRef.current) window.clearTimeout(copyTimerRef.current);
+    copyTimerRef.current = window.setTimeout(() => setCopiedMessage(null), 1800);
   };
 
   const startNewChat = () => {
@@ -504,7 +549,10 @@ function App() {
             <button onClick={() => setSettingsOpen(true)}><Gear /> Connection</button>
             <div className="server-state">
               <span className={`status-dot ${isHealthy ? "online" : "offline"}`} />
-              <span>{health?.warmup?.status === "warming" ? "Loading models" : isHealthy ? "Server ready" : "Server unavailable"}</span>
+              <span>
+                <strong>{health?.warmup?.status === "warming" ? "Loading models" : isHealthy ? "Server ready" : "Server unavailable"}</strong>
+                <small title={connectedServer}>{serverHost}</small>
+              </span>
               {health?.queue.waiting ? <Badge color="amber">{health.queue.waiting} queued</Badge> : null}
             </div>
           </div>
@@ -572,12 +620,20 @@ function App() {
           <section className="chat-region" aria-live="polite">
             {messages.length === 0 ? (
               <div className="empty-chat">
-                <div className="empty-symbol"><Sparkle weight="fill" /></div>
-                <h1>Ask your private knowledge.</h1>
-                <p>Your documents stay grounded in citations while Gemma runs on your own hardware.</p>
+                <div className="workspace-intro">
+                  <div className="empty-symbol"><Sparkle weight="fill" /></div>
+                  <h1>Search your knowledge. Keep it private.</h1>
+                  <p>Ask trusted documents while Gemma runs on your hardware and cites every answer.</p>
+                </div>
+                <div className="workspace-overview" aria-label="Workspace status">
+                  <div><CheckCircle weight="fill" /><span>Server<strong>{isHealthy ? "Ready" : "Offline"}</strong></span></div>
+                  <div><Books /><span>Documents<strong>{health?.neon?.stored_documents ?? documents.length}</strong></span></div>
+                  <div><Database /><span>Chunks<strong>{health?.neon?.stored_chunks ?? 0}</strong></span></div>
+                  <div><Gauge /><span>Mode<strong>{profiles.find((item) => item.id === profile)?.label || "Auto"}</strong></span></div>
+                </div>
                 <div className="suggestions">
-                  {["Summarize my most recently uploaded document", "Which models are in the RAG workflow?", "Explain the cited architecture"].map((suggestion) => (
-                    <button key={suggestion} onClick={() => setPrompt(suggestion)}>{suggestion}</button>
+                  {["Summarize my latest document", "Find records about export opportunities", "Compare the models in this archive", "Show the evidence for PG2473"].map((suggestion) => (
+                    <button key={suggestion} onClick={() => setPrompt(suggestion)}><ChatCircle /><span>{suggestion}</span></button>
                   ))}
                 </div>
               </div>
@@ -591,10 +647,25 @@ function App() {
                   >
                     <div className="message-author">{message.role === "user" ? "You" : "Gemma"}</div>
                     <div className="message-content">
-                      {message.content || (generating && message.role === "assistant" ? (
+                      {message.content ? (
+                        <Suspense fallback={<span className="message-plain">{message.content}</span>}>
+                          <MarkdownContent>{message.content}</MarkdownContent>
+                        </Suspense>
+                      ) : generating && message.role === "assistant" ? (
                         <span className="thinking"><CircleNotch className="spin" /> Preparing context</span>
-                      ) : null)}
+                      ) : null}
                     </div>
+                    {message.role === "assistant" && message.content ? (
+                      <div className="message-actions">
+                        <button onClick={() => void copyAnswer(message)} aria-label="Copy answer">
+                          {copiedMessage === message.id ? <Check /> : <Copy />}
+                          {copiedMessage === message.id ? "Copied" : "Copy"}
+                        </button>
+                        {message.metrics.cache_hit ? <span>Cached response</span> : null}
+                        {message.metrics.generation_tokens_per_second ? <span>{message.metrics.generation_tokens_per_second} tokens/sec</span> : null}
+                        {message.metrics.retrieval_ms ? <span>{Math.round(message.metrics.retrieval_ms)} ms retrieval</span> : null}
+                      </div>
+                    ) : null}
                     {message.sources.length ? (
                       <div className="citation-row">
                         {message.sources.slice(0, 4).map((source) => (
@@ -670,13 +741,19 @@ function App() {
         <Dialog.Content maxWidth="440px">
           <Dialog.Title>Connect to your server</Dialog.Title>
           <Dialog.Description size="2" mb="4">
-            Enter the API key configured on the secondary laptop. It is kept only for this browser session.
+            Use the secure address of your secondary laptop and its Local RAG API key.
           </Dialog.Description>
+          <label className="field-label" htmlFor="api-url">Server address</label>
+          <TextField.Root id="api-url" type="url" value={apiUrlInput} onChange={(event) => setApiUrlInput(event.target.value)} placeholder="https://your-server.tailnet.ts.net" />
+          <p className="field-help">Leave this device's address here when the frontend is served by FastAPI.</p>
           <label className="field-label" htmlFor="api-key">API key</label>
           <TextField.Root id="api-key" type="password" value={apiKeyInput} onChange={(event) => setApiKeyInput(event.target.value)} placeholder="Paste API key" />
           <div className="dialog-actions">
             {storedApiKey() ? <Button variant="soft" color="gray" onClick={() => setSettingsOpen(false)}>Cancel</Button> : null}
-            <Button onClick={saveKey}><SignIn /> Connect</Button>
+            <Button onClick={() => void saveConnection()} disabled={connecting || !apiKeyInput.trim()}>
+              {connecting ? <CircleNotch className="spin" /> : <SignIn />}
+              {connecting ? "Testing" : "Connect"}
+            </Button>
           </div>
         </Dialog.Content>
       </Dialog.Root>
@@ -689,8 +766,8 @@ function App() {
             <label className="file-drop" htmlFor="document-file">
               <FileArrowUp />
               <strong>{uploadFile?.name || "Choose a document"}</strong>
-              <span>PDF, DOCX, TXT, PNG or JPG up to 25 MB</span>
-              <input id="document-file" type="file" accept=".pdf,.docx,.txt,.md,.csv,.json,.png,.jpg,.jpeg" onChange={(event) => setUploadFile(event.target.files?.[0] || null)} />
+              <span>PDF, DOCX, XLSX, TXT, PNG or JPG up to 25 MB</span>
+              <input id="document-file" type="file" accept=".pdf,.docx,.xlsx,.txt,.md,.csv,.json,.png,.jpg,.jpeg" onChange={(event) => setUploadFile(event.target.files?.[0] || null)} />
             </label>
             <div>
               <label className="field-label" htmlFor="source-name">Source name</label>

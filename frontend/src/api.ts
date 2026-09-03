@@ -117,8 +117,23 @@ export type UserRecord = {
   created_at: string;
 };
 
-const API_BASE = (import.meta.env.VITE_API_URL || "").replace(/\/$/, "");
+const DEFAULT_API_BASE = (import.meta.env.VITE_API_URL || "").replace(/\/$/, "");
+const API_URL_NAME = "local-rag-api-url";
 const KEY_NAME = "local-rag-api-key";
+
+export function storedApiUrl(): string {
+  return localStorage.getItem(API_URL_NAME) || DEFAULT_API_BASE;
+}
+
+export function storeApiUrl(value: string): void {
+  const normalized = value.trim().replace(/\/$/, "");
+  if (normalized) localStorage.setItem(API_URL_NAME, normalized);
+  else localStorage.removeItem(API_URL_NAME);
+}
+
+export function displayApiUrl(): string {
+  return storedApiUrl() || window.location.origin;
+}
 
 export class ApiError extends Error {
   constructor(public status: number, message: string) {
@@ -144,7 +159,7 @@ function authHeaders(json = false): HeadersInit {
 }
 
 async function requestJson<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const response = await fetch(`${API_BASE}${path}`, {
+  const response = await fetch(`${storedApiUrl()}${path}`, {
     ...init,
     headers: { ...authHeaders(Boolean(init.body && !(init.body instanceof FormData))), ...init.headers },
     credentials: "same-origin"
@@ -252,7 +267,7 @@ export async function streamChat(
   callbacks: StreamCallbacks,
   signal: AbortSignal
 ): Promise<void> {
-  const response = await fetch(`${API_BASE}/v1/chat/completions`, {
+  const response = await fetch(`${storedApiUrl()}/v1/chat/completions`, {
     method: "POST",
     headers: authHeaders(true),
     credentials: "same-origin",
