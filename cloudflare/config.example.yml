@@ -1,0 +1,11 @@
+# Copy this file to config.yml only after creating a named Cloudflare Tunnel.
+# Never commit the generated tunnel credentials JSON file.
+tunnel: REPLACE_WITH_TUNNEL_UUID
+credentials-file: C:\Users\YOUR_WINDOWS_USER\.cloudflared\REPLACE_WITH_TUNNEL_UUID.json
+
+ingress:
+  - hostname: rag.example.com
+    service: http://127.0.0.1:8000
+    originRequest:
+      connectTimeout: 30s
+  - service: http_status:404

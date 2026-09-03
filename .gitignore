@@ -11,3 +11,9 @@ frontend/node_modules/
 frontend/*.tsbuildinfo
 frontend/vite.config.js
 frontend/vite.config.d.ts
+cloudflare/config.yml
+cloudflare/*.json
+cloudflare/*.pem
+cloudflare/*.token
+cloudflare/logs/
+tools/cloudflared.exe

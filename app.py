@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -12,6 +13,7 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
+from collections import deque
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -25,6 +27,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 from pgvector import Vector
 from pgvector.psycopg import register_vector
 from psycopg_pool import ConnectionPool
@@ -64,10 +67,18 @@ RUN_MIGRATIONS = os.getenv("RUN_MIGRATIONS", "true").lower() in {"1", "true", "y
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_MB", "25")) * 1024 * 1024
 MAX_QUEUED_REQUESTS = int(os.getenv("MAX_QUEUED_REQUESTS", "5"))
 QUEUE_WAIT_SECONDS = float(os.getenv("QUEUE_WAIT_SECONDS", "180"))
+REQUEST_TIMEOUT_SECONDS = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "360"))
+RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "60"))
+RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
 ALLOWED_ORIGINS = [
     origin.strip()
     for origin in os.getenv("ALLOWED_ORIGINS", "").split(",")
     if origin.strip()
+]
+ALLOWED_HOSTS = [
+    host.strip()
+    for host in os.getenv("ALLOWED_HOSTS", "").split(",")
+    if host.strip()
 ]
 PROJECT_DIR = Path(__file__).resolve().parent
 FRONTEND_DIST = PROJECT_DIR / "frontend" / "dist"
@@ -84,6 +95,8 @@ MODEL_GATE = InferenceQueue(MAX_QUEUED_REQUESTS, QUEUE_WAIT_SECONDS)
 CANCEL_EVENTS: dict[str, threading.Event] = {}
 CANCEL_EVENTS_LOCK = threading.Lock()
 DB_POOL: ConnectionPool | None = None
+RATE_LIMIT_BUCKETS: dict[str, deque[float]] = {}
+RATE_LIMIT_LOCK = threading.Lock()
 WARMUP_LOCK = threading.Lock()
 WARMUP_STATE: dict[str, object] = {
     "status": "pending" if WARM_MODELS else "disabled",
@@ -133,6 +146,14 @@ app = FastAPI(
     version="1.0.0",
     description="OpenAI-compatible chat with Neon retrieval and local Ollama generation.",
 )
+
+if "*" in ALLOWED_ORIGINS:
+    raise RuntimeError(
+        "ALLOWED_ORIGINS cannot contain '*' because authenticated requests use credentials"
+    )
+
+if ALLOWED_HOSTS:
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
 
 if ALLOWED_ORIGINS:
     app.add_middleware(
@@ -204,6 +225,56 @@ def api_key_hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def rate_limit_identities(request: Request) -> list[str]:
+    """Return non-sensitive client and credential identities for rate limiting."""
+    address = request.client.host if request.client else "unknown"
+    if address in {"127.0.0.1", "::1"}:
+        address = request.headers.get("cf-connecting-ip", address).strip()[:64]
+    identities = [f"ip:{address}"]
+    provided = request.headers.get("x-api-key", "")
+    if provided:
+        identities.append(f"key:{api_key_hash(provided)}")
+    return identities
+
+
+def take_rate_limit_slot(identity: str, now: float | None = None) -> float | None:
+    """Reserve one request slot, or return the seconds until another is available."""
+    if RATE_LIMIT_REQUESTS <= 0 or RATE_LIMIT_WINDOW_SECONDS <= 0:
+        return None
+    moment = time.monotonic() if now is None else now
+    cutoff = moment - RATE_LIMIT_WINDOW_SECONDS
+    with RATE_LIMIT_LOCK:
+        bucket = RATE_LIMIT_BUCKETS.setdefault(identity, deque())
+        while bucket and bucket[0] <= cutoff:
+            bucket.popleft()
+        if len(bucket) >= RATE_LIMIT_REQUESTS:
+            return max(0.01, RATE_LIMIT_WINDOW_SECONDS - (moment - bucket[0]))
+        bucket.append(moment)
+    return None
+
+
+def apply_security_headers(response, request: Request):
+    """Apply browser and proxy-safe headers to every response."""
+    headers = response.headers
+    headers["X-Content-Type-Options"] = "nosniff"
+    headers["X-Frame-Options"] = "DENY"
+    headers["Referrer-Policy"] = "no-referrer"
+    headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    headers["Cross-Origin-Opener-Policy"] = "same-origin"
+    headers["Content-Security-Policy"] = (
+        "default-src 'self'; base-uri 'self'; object-src 'none'; "
+        "frame-ancestors 'none'; form-action 'self'; img-src 'self' data:; "
+        "font-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; "
+        "connect-src 'self' https: http://127.0.0.1:* http://localhost:*"
+    )
+    if request.url.path.startswith("/v1/"):
+        headers["Cache-Control"] = "no-store"
+    forwarded_proto = request.headers.get("x-forwarded-proto", "").split(",", 1)[0].strip()
+    if request.url.scheme == "https" or forwarded_proto == "https":
+        headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    return response
+
+
 def require_api_key(provided: str | None = Depends(API_KEY_HEADER)) -> Principal:
     if not API_KEY:
         if REQUIRE_API_KEY:
@@ -238,24 +309,53 @@ def require_admin(principal: Principal = Depends(require_api_key)) -> Principal:
 @app.middleware("http")
 async def request_safety(request: Request, call_next):
     request_id = uuid.uuid4().hex[:12]
+    if request.url.path.startswith("/v1/"):
+        retry_after = None
+        for identity in rate_limit_identities(request):
+            retry_after = take_rate_limit_slot(identity)
+            if retry_after is not None:
+                break
+        if retry_after is not None:
+            response = JSONResponse(
+                {"detail": "Too many requests. Please retry shortly."},
+                status_code=429,
+                headers={
+                    "X-Request-ID": request_id,
+                    "Retry-After": str(max(1, int(retry_after + 0.999))),
+                },
+            )
+            return apply_security_headers(response, request)
     length = request.headers.get("content-length")
     if length:
         try:
             if int(length) > MAX_UPLOAD_BYTES:
-                return JSONResponse(
+                response = JSONResponse(
                     {"detail": f"Request exceeds the {MAX_UPLOAD_BYTES // 1024 // 1024} MB limit"},
                     status_code=413,
                     headers={"X-Request-ID": request_id},
                 )
+                return apply_security_headers(response, request)
         except ValueError:
-            return JSONResponse(
+            response = JSONResponse(
                 {"detail": "Invalid Content-Length header"},
                 status_code=400,
                 headers={"X-Request-ID": request_id},
             )
+            return apply_security_headers(response, request)
     started = time.perf_counter()
-    response = await call_next(request)
+    try:
+        response = await asyncio.wait_for(
+            call_next(request), timeout=REQUEST_TIMEOUT_SECONDS
+        )
+    except asyncio.TimeoutError:
+        LOGGER.warning("Request timed out request_id=%s", request_id)
+        response = JSONResponse(
+            {"detail": "Request timed out"},
+            status_code=504,
+            headers={"X-Request-ID": request_id},
+        )
     response.headers["X-Request-ID"] = request_id
+    apply_security_headers(response, request)
     LOGGER.info(
         "%s %s status=%s duration_ms=%.2f request_id=%s",
         request.method,

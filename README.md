@@ -331,6 +331,81 @@ failure, and hides the PowerShell window. Remove it with:
 .\scripts\remove-startup-task.ps1
 ```
 
+## Publish safely with a named Cloudflare Tunnel
+
+Use a named tunnel for production. Keep FastAPI bound to `127.0.0.1:8000`;
+Cloudflare Tunnel makes the outbound connection, so do not open port 8000 on
+the router or Windows Firewall. Quick Tunnels are suitable only for temporary
+testing and are not part of this deployment.
+
+Before the account-specific setup, install the official signed `cloudflared`
+binary inside the project, start Local RAG, and run the local preflight check:
+
+```powershell
+.\scripts\install-cloudflared.ps1
+.\scripts\test-cloudflare-prerequisites.ps1
+```
+
+Then complete the account-owned steps manually. These commands open a browser
+and create Cloudflare credentials, so they must not be automated or committed:
+
+```powershell
+.\tools\cloudflared.exe tunnel login
+.\tools\cloudflared.exe tunnel create local-rag
+.\tools\cloudflared.exe tunnel route dns local-rag rag.example.com
+```
+
+Copy `cloudflare\config.example.yml` to
+`$env:USERPROFILE\.cloudflared\config.yml`, replace the tunnel UUID,
+credentials path, and hostname, then validate and start it:
+
+```powershell
+.\scripts\test-cloudflare-prerequisites.ps1 `
+    -ConfigPath "$env:USERPROFILE\.cloudflared\config.yml"
+
+.\scripts\start-cloudflare-tunnel.ps1 `
+    -TunnelName "local-rag" `
+    -ConfigPath "$env:USERPROFILE\.cloudflared\config.yml"
+```
+
+For automatic startup after Windows sign-in:
+
+```powershell
+.\scripts\install-cloudflare-tunnel-task.ps1 `
+    -TunnelName "local-rag" `
+    -ConfigPath "$env:USERPROFILE\.cloudflared\config.yml"
+
+.\scripts\get-cloudflare-tunnel-status.ps1 `
+    -TunnelName "local-rag" `
+    -PublicHostname "rag.example.com"
+```
+
+Remove only the scheduled task with
+`.\scripts\remove-cloudflare-tunnel-task.ps1`. The removal script deliberately
+keeps the tunnel configuration and credentials so recovery is straightforward.
+
+In Cloudflare Zero Trust, create a self-hosted Access application for the exact
+hostname. Add an Allow policy containing only approved email addresses or your
+company email domain, and choose a short session duration such as eight hours.
+Keep `X-API-Key` enabled in Local RAG as a second application-level check.
+
+Production `.env` example:
+
+```dotenv
+REQUIRE_API_KEY=true
+ALLOWED_ORIGINS=https://rag.example.com
+ALLOWED_HOSTS=127.0.0.1,localhost,rag.example.com
+PUBLIC_BASE_URL=https://rag.example.com
+REQUEST_TIMEOUT_SECONDS=360
+RATE_LIMIT_REQUESTS=60
+RATE_LIMIT_WINDOW_SECONDS=60
+```
+
+Use only exact HTTPS origins. The server rejects wildcard CORS configuration,
+adds browser security headers, enforces request-size and request-time limits,
+and rate-limits `/v1` traffic without storing or logging raw API keys. Avoid
+`debug` tunnel logging because request headers may contain authentication data.
+
 ## Endpoints
 
 - `GET /health` — Ollama, Neon, database counts, and security status

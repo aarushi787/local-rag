@@ -9,6 +9,9 @@ from io import BytesIO
 from pathlib import Path
 
 import app
+from fastapi import HTTPException
+from fastapi.responses import JSONResponse
+from starlette.requests import Request
 from drive_sync import safe_extract_zip
 from document_processing import DocumentPage, TextBlock, extract_document, union_bbox
 from extract_ocr import result_lines
@@ -314,6 +317,64 @@ class InferenceQueueTests(unittest.TestCase):
             queue.acquire(cancelled)
         self.assertEqual(queue.snapshot()["waiting"], 0)
         queue.release()
+
+
+class ProductionBoundaryTests(unittest.TestCase):
+    @staticmethod
+    def request(path: str = "/v1/models", forwarded_proto: str = "http") -> Request:
+        return Request(
+            {
+                "type": "http",
+                "http_version": "1.1",
+                "method": "GET",
+                "scheme": "http",
+                "path": path,
+                "raw_path": path.encode(),
+                "query_string": b"",
+                "headers": [(b"x-forwarded-proto", forwarded_proto.encode())],
+                "client": ("127.0.0.1", 50000),
+                "server": ("127.0.0.1", 8000),
+            }
+        )
+
+    def test_security_headers_and_hsts_are_applied(self) -> None:
+        response = JSONResponse({"ok": True})
+        app.apply_security_headers(response, self.request(forwarded_proto="https"))
+        self.assertEqual(response.headers["x-content-type-options"], "nosniff")
+        self.assertEqual(response.headers["x-frame-options"], "DENY")
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        self.assertIn("max-age=31536000", response.headers["strict-transport-security"])
+
+    def test_rate_limiter_does_not_store_raw_api_key(self) -> None:
+        original_requests = app.RATE_LIMIT_REQUESTS
+        original_window = app.RATE_LIMIT_WINDOW_SECONDS
+        try:
+            app.RATE_LIMIT_REQUESTS = 2
+            app.RATE_LIMIT_WINDOW_SECONDS = 60
+            app.RATE_LIMIT_BUCKETS.clear()
+            self.assertIsNone(app.take_rate_limit_slot("key:hashed", now=100))
+            self.assertIsNone(app.take_rate_limit_slot("key:hashed", now=101))
+            self.assertGreater(app.take_rate_limit_slot("key:hashed", now=102), 0)
+            self.assertNotIn("raw-secret", app.RATE_LIMIT_BUCKETS)
+        finally:
+            app.RATE_LIMIT_REQUESTS = original_requests
+            app.RATE_LIMIT_WINDOW_SECONDS = original_window
+            app.RATE_LIMIT_BUCKETS.clear()
+
+    def test_master_api_key_authentication_and_missing_key(self) -> None:
+        original_key = app.API_KEY
+        original_required = app.REQUIRE_API_KEY
+        try:
+            app.API_KEY = "test-master-key"
+            app.REQUIRE_API_KEY = True
+            principal = app.require_api_key("test-master-key")
+            self.assertTrue(principal.is_admin)
+            with self.assertRaises(HTTPException) as raised:
+                app.require_api_key(None)
+            self.assertEqual(raised.exception.status_code, 401)
+        finally:
+            app.API_KEY = original_key
+            app.REQUIRE_API_KEY = original_required
 
 
 if __name__ == "__main__":
