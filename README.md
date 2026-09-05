@@ -1,5 +1,10 @@
 # Local RAG API
 
+> **Xeon server deployment:** The guarded Windows Server 2025 build kit for
+> Ollama + Open WebUI is in [`server-build/`](server-build/README.md). It is
+> intentionally isolated from this laptop application because the two stacks
+> use different ports and service layouts.
+
 This Windows-friendly service combines local Ollama models with Neon PostgreSQL
 and pgvector. It supports background document extraction, parent-child
 structural chunking, hybrid MMR retrieval with neighboring context,
@@ -50,7 +55,7 @@ boxes are converted back to the original image coordinates. Change
 ### Window 1: Ollama
 
 ```powershell
-$env:OLLAMA_HOST = "127.0.0.1:8080"
+$env:OLLAMA_HOST = "127.0.0.1:11434"
 $env:OLLAMA_MAX_LOADED_MODELS = "1"
 $env:OLLAMA_NUM_PARALLEL = "1"
 ollama serve
@@ -296,7 +301,7 @@ slow on CPU.
 The recommended prompt-only profile is in `models\Modelfile.gemma-rag`:
 
 ```powershell
-$env:OLLAMA_HOST = "127.0.0.1:8080"
+$env:OLLAMA_HOST = "127.0.0.1:11434"
 ollama create local-rag-gemma -f .\models\Modelfile.gemma-rag
 ```
 
@@ -441,6 +446,8 @@ and rate-limits `/v1` traffic without storing or logging raw API keys. Avoid
 - `GET /v1/profiles` — Auto, Fast, Balanced, and Quality mode settings
 - `GET /v1/me` — current authenticated user and role
 - `GET/POST /v1/users` — list or create users (administrator only)
+- `POST /v1/users/{id}/rotate-key` — invalidate and replace a user's API key (administrator only)
+- `PATCH /v1/users/{id}/limits` — set per-account RPM, concurrency, model allowlist, expiry and active state
 - `DELETE /v1/users/{id}` — deactivate a user (administrator only)
 - `GET /v1/queue` — current inference workload
 - `POST /v1/chat/cancel/{request_id}` — stop an active or waiting generation
@@ -451,9 +458,11 @@ and rate-limits `/v1` traffic without storing or logging raw API keys. Avoid
 - `POST /v1/documents` — ingest supplied plain text
 - `POST /v1/documents/upload` — automatically process supported files
 - `PUT /v1/documents/{id}/permissions` — grant document access
+- `PATCH /v1/documents/{id}/lifecycle` — activate, archive, or supersede a document version
 - `DELETE /v1/documents/{id}` — remove a document and its chunks
 - `GET/POST /v1/ingestion-jobs` — inspect or create background ingestion jobs
 - `GET/POST /v1/evaluations` — inspect or start baseline/upgraded evaluations
+- `GET /v1/metrics/summary` — administrator-only p50/p95 latency and throughput summary
 - `POST /v1/chat/completions` — hybrid RAG chat with optional SSE streaming
 
 `POST /v1/chat/completions` also accepts optional `profile` and `document_id`
@@ -472,3 +481,23 @@ Ollama restart is a cold start; following requests are substantially faster.
 Neon startup uses bounded retries and pool reconnection, ingestion is restricted
 to a bounded single-worker lane by default, and logs are structured JSON without
 request bodies or document content.
+
+The full safety architecture, shadow-index procedure, cross-encoder staging,
+evaluation gate, and restore drill are documented in
+`HARDENING_RELEASE_2026-09-04.md`.
+
+
+
+$adminKey = ((Get-Content .env | Where-Object { $_ -match '^RAG_API_KEY=' }) -replace '^RAG_API_KEY=', '').Trim()
+
+$body = @{
+    name = "Alice"
+    role = "user"
+} | ConvertTo-Json
+
+Invoke-RestMethod `
+    -Method Post `
+    -Uri "http://127.0.0.1:8000/v1/users" `
+    -Headers @{ "X-API-Key" = $adminKey } `
+    -ContentType "application/json" `
+    -Body $body

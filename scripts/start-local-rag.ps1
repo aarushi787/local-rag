@@ -64,10 +64,10 @@ if (-not (Test-Path -LiteralPath (Join-Path $frontend "dist\index.html"))) {
 }
 
 try {
-    Invoke-RestMethod -Uri "http://127.0.0.1:8080/api/tags" -TimeoutSec 2 | Out-Null
+    Invoke-RestMethod -Uri "http://127.0.0.1:11434/api/tags" -TimeoutSec 2 | Out-Null
 }
 catch {
-    $env:OLLAMA_HOST = "127.0.0.1:8080"
+    $env:OLLAMA_HOST = "127.0.0.1:11434"
     $env:OLLAMA_MAX_LOADED_MODELS = "2"
     $env:OLLAMA_NUM_PARALLEL = "1"
     $env:OLLAMA_KEEP_ALIVE = "30m"

@@ -20,10 +20,10 @@ import {
   Moon,
   Plus,
   PencilSimple,
+  ArrowsClockwise,
   ShieldCheck,
   SidebarSimple,
   SignIn,
-  Sparkle,
   Square,
   Sun,
   Trash,
@@ -43,6 +43,7 @@ import {
   ApiError,
   cancelChat,
   createUser,
+  rotateUserKey,
   CurrentUser,
   deleteConversation,
   deleteDocument,
@@ -86,7 +87,11 @@ type UiMessage = {
   metrics: Metrics;
 };
 
-const makeId = () => crypto.randomUUID();
+const makeId = () =>
+  globalThis.crypto?.randomUUID?.() ??
+  `${Date.now()}-${Math.random().toString(16).slice(2)}-${Math.random()
+    .toString(16)
+    .slice(2)}`;
 const lastUserIndex = (items: UiMessage[]) => {
   for (let index = items.length - 1; index >= 0; index -= 1) {
     if (items[index].role === "user") return index;
@@ -114,6 +119,7 @@ function App() {
     return matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
   });
   const [health, setHealth] = useState<Health | null>(null);
+  const [healthChecked, setHealthChecked] = useState(false);
   const [models, setModels] = useState<string[]>([]);
   const [model, setModel] = useState("gemma4:e2b-it-qat");
   const [profiles, setProfiles] = useState<ResponseProfile[]>([]);
@@ -131,6 +137,7 @@ function App() {
   const [selectedDocument, setSelectedDocument] = useState("all");
   const [generating, setGenerating] = useState(false);
   const [queuePosition, setQueuePosition] = useState(0);
+  const [generationStage, setGenerationStage] = useState("");
   const [activeRequestId, setActiveRequestId] = useState<string | null>(null);
   const [error, setError] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(!storedApiKey());
@@ -177,6 +184,11 @@ function App() {
     () => [...messages].reverse().find((message) => message.role === "assistant")?.metrics,
     [messages]
   );
+  const latestSources = useMemo(
+    () => [...messages].reverse().find((message) => message.role === "assistant" && message.sources.length)?.sources || [],
+    [messages]
+  );
+  const visibleSourceCount = activeSources.length || latestSources.length;
   const filteredConversations = useMemo(() => {
     const query = conversationSearch.trim().toLowerCase();
     return query
@@ -231,6 +243,8 @@ function App() {
       setHealth(await getHealth());
     } catch {
       setHealth(null);
+    } finally {
+      setHealthChecked(true);
     }
   };
 
@@ -436,6 +450,7 @@ function App() {
     setEditingLastTurn(false);
     setGenerating(true);
     setQueuePosition(0);
+    setGenerationStage("Preparing request");
     setError("");
     setActiveSources([]);
     const controller = new AbortController();
@@ -458,6 +473,7 @@ function App() {
             setActiveRequestId(requestId);
             setQueuePosition(position);
           },
+          onStatus: (_stage, message) => setGenerationStage(message),
           onStart: (newConversationId, sources, routedModel) => {
             if (newConversationId) setConversationId(newConversationId);
             if (routedModel) setModel(routedModel);
@@ -470,6 +486,7 @@ function App() {
           },
           onToken: (token) => {
             setQueuePosition(0);
+            setGenerationStage("");
             setMessages((current) =>
               current.map((message) =>
                 message.id === assistantId
@@ -505,6 +522,7 @@ function App() {
     } finally {
       setGenerating(false);
       setQueuePosition(0);
+      setGenerationStage("");
       setActiveRequestId(null);
       abortRef.current = null;
     }
@@ -535,8 +553,13 @@ function App() {
   const handleComposerKey = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
-      void sendPrompt();
+      event.currentTarget.form?.requestSubmit();
     }
+  };
+
+  const submitPrompt = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    void sendPrompt();
   };
 
   const openDocuments = async () => {
@@ -616,6 +639,16 @@ function App() {
     }
   };
 
+  const rotateKey = async (user: UserRecord) => {
+    try {
+      const rotated = await rotateUserKey(user.id);
+      setCreatedApiKey(rotated.api_key);
+      setError("");
+    } catch (caught) {
+      handleApiError(caught);
+    }
+  };
+
   const grantDocumentAccess = async () => {
     if (!permissionUser || !permissionDocument) return;
     try {
@@ -638,7 +671,7 @@ function App() {
 
         <aside className={`sidebar ${sidebarOpen ? "open" : ""}`}>
           <div className="brand-row">
-            <div className="brand-mark" aria-hidden="true"><Sparkle weight="fill" /></div>
+            <div className="brand-mark" aria-hidden="true"><Books weight="fill" /></div>
             <div>
               <strong>Local RAG</strong>
               <span>Private AI workspace</span>
@@ -671,6 +704,7 @@ function App() {
                   <button
                     className="conversation-open"
                     onClick={() => void openConversation(conversation.id)}
+                    aria-current={conversation.id === conversationId ? "page" : undefined}
                   >
                     <ChatCircle aria-hidden="true" />
                     <span>
@@ -697,9 +731,9 @@ function App() {
             {currentUser?.role === "admin" ? <button onClick={() => void openSecurity()}><ShieldCheck /> Access</button> : null}
             <button onClick={() => setSettingsOpen(true)}><Gear /> Connection</button>
             <div className="server-state">
-              <span className={`status-dot ${isHealthy ? "online" : "offline"}`} />
+              <span className={`status-dot ${!healthChecked ? "waiting" : isHealthy ? "online" : "offline"}`} />
               <span>
-                <strong>{health?.warmup?.status === "warming" ? "Loading models" : isHealthy ? "Server ready" : "Server unavailable"}</strong>
+                <strong>{!healthChecked ? "Checking server" : health?.warmup?.status === "warming" ? "Loading models" : isHealthy ? "Server ready" : "Server unavailable"}</strong>
                 <small title={connectedServer}>{serverHost}</small>
               </span>
               {health?.queue.waiting ? <Badge color="amber">{health.queue.waiting} queued</Badge> : null}
@@ -714,6 +748,7 @@ function App() {
             </IconButton>
             <div className="topbar-control mode-control">
               <Gauge aria-hidden="true" />
+              <span className="control-label">Response</span>
               <Select.Root value={profile} onValueChange={(value) => changeProfile(value as ResponseProfile["id"])} disabled={generating}>
                 <Select.Trigger aria-label="Response mode" />
                 <Select.Content>
@@ -730,6 +765,7 @@ function App() {
             </div>
             <div className="topbar-control document-control">
               <FileText aria-hidden="true" />
+              <span className="control-label">Scope</span>
               <Select.Root value={selectedDocument} onValueChange={setSelectedDocument} disabled={generating}>
                 <Select.Trigger aria-label="Search scope" />
                 <Select.Content>
@@ -759,38 +795,58 @@ function App() {
                 {theme === "dark" ? <Sun /> : <Moon />}
               </IconButton>
             </Tooltip>
-            <Tooltip content="Toggle sources">
-              <IconButton variant="ghost" onClick={() => setActiveSources(activeSources.length ? [] : messages.at(-1)?.sources || [])} aria-label="Toggle sources">
+            <Tooltip content={visibleSourceCount ? `${visibleSourceCount} sources` : "Sources appear with grounded answers"}>
+              <IconButton
+                className="sources-toggle"
+                variant="ghost"
+                disabled={!visibleSourceCount}
+                onClick={() => setActiveSources(activeSources.length ? [] : latestSources)}
+                aria-label={visibleSourceCount ? `Toggle ${visibleSourceCount} sources` : "No sources available"}
+              >
                 <SidebarSimple />
+                {visibleSourceCount ? <span className="source-count" aria-hidden="true">{visibleSourceCount}</span> : null}
               </IconButton>
             </Tooltip>
           </header>
 
           <div className="component-statuses" aria-label="Service status">
-            <span><i className={`status-dot ${health ? "online" : "offline"}`} />Server</span>
-            <span><i className={`status-dot ${health?.ollama?.status === "connected" ? "online" : "offline"}`} />Ollama</span>
-            <span><i className={`status-dot ${health?.neon?.status === "connected" ? "online" : "offline"}`} />Neon</span>
-            <span><i className={`status-dot ${health?.warmup?.status === "ready" ? "online" : health?.warmup?.status === "warming" ? "waiting" : "offline"}`} />Model</span>
+            <strong>{!healthChecked ? "Checking systems" : health?.warmup?.status === "warming" ? "Models loading" : isHealthy ? "Systems ready" : "Needs attention"}</strong>
+            <span><i className={`status-dot ${!healthChecked ? "waiting" : isHealthy ? "online" : "offline"}`} />Server</span>
+            <span><i className={`status-dot ${!healthChecked ? "waiting" : health?.ollama?.status === "connected" ? "online" : "offline"}`} />Ollama</span>
+            <span><i className={`status-dot ${!healthChecked ? "waiting" : health?.database?.status === "connected" ? "online" : "offline"}`} />Database</span>
+            <span><i className={`status-dot ${!healthChecked ? "waiting" : health?.warmup?.status === "ready" ? "online" : health?.warmup?.status === "warming" ? "waiting" : "offline"}`} />Model</span>
           </div>
 
-          <section className="chat-region" aria-live="polite">
+          <section className="chat-region" aria-live="polite" aria-busy={generating}>
             {messages.length === 0 ? (
               <div className="empty-chat">
-                <div className="workspace-intro">
-                  <div className="empty-symbol"><Sparkle weight="fill" /></div>
-                  <h1>Search your knowledge. Keep it private.</h1>
-                  <p>Ask trusted documents while Gemma runs on your hardware and cites every answer.</p>
-                </div>
-                <div className="workspace-overview" aria-label="Workspace status">
-                  <div><CheckCircle weight="fill" /><span>Server<strong>{isHealthy ? "Ready" : "Offline"}</strong></span></div>
-                  <div><Books /><span>Documents<strong>{health?.neon?.stored_documents ?? documents.length}</strong></span></div>
-                  <div><Database /><span>Chunks<strong>{health?.neon?.stored_chunks ?? 0}</strong></span></div>
-                  <div><Gauge /><span>Mode<strong>{profiles.find((item) => item.id === profile)?.label || "Auto"}</strong></span></div>
-                </div>
-                <div className="suggestions">
-                  {["Summarize my latest document", "Find records about export opportunities", "Compare the models in this archive", "Show the evidence for PG2473"].map((suggestion) => (
-                    <button key={suggestion} onClick={() => setPrompt(suggestion)}><ChatCircle /><span>{suggestion}</span></button>
-                  ))}
+                <div className="welcome-layout">
+                  <div className="workspace-intro">
+                    <div className="privacy-kicker"><ShieldCheck weight="fill" /> Private server, cited answers</div>
+                    <h1>Ask your private knowledge.</h1>
+                    <p>Gemma searches the documents on this server, builds a grounded answer, and keeps the evidence within reach.</p>
+                    <div className="starter-prompts">
+                      <span>Start with a useful question</span>
+                      <div className="suggestions">
+                        {["Summarize my latest document", "Find records about export opportunities", "Compare the models in this archive", "Show the evidence for PG2473"].map((suggestion) => (
+                          <button key={suggestion} onClick={() => { setPrompt(suggestion); composerRef.current?.focus(); }}><ChatCircle /><span>{suggestion}</span><ArrowUp weight="bold" /></button>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                  <aside className="workspace-summary" aria-label="Workspace status">
+                    <div className="workspace-summary-head">
+                      <span className={`status-dot ${!healthChecked ? "waiting" : isHealthy ? "online" : "offline"}`} />
+                      <div><strong>{!healthChecked ? "Checking workspace" : isHealthy ? "Workspace ready" : "Workspace offline"}</strong><small>Live status from this server</small></div>
+                    </div>
+                    <div className="workspace-overview">
+                      <div><Books /><span>Documents<strong>{health?.database?.stored_documents ?? documents.length}</strong></span></div>
+                      <div><Database /><span>Search chunks<strong>{health?.database?.stored_chunks ?? 0}</strong></span></div>
+                      <div><Gauge /><span>Response mode<strong>{profiles.find((item) => item.id === profile)?.label || "Auto"}</strong></span></div>
+                      <div><FileText /><span>Search scope<strong>{selectedDocument === "all" ? "All documents" : documents.find((item) => item.id === selectedDocument)?.source || "Selected document"}</strong></span></div>
+                    </div>
+                    <div className="active-model"><span>Active model</span><strong title={model}>{model}</strong><small>Processing stays on your hardware</small></div>
+                  </aside>
                 </div>
               </div>
             ) : (
@@ -857,8 +913,9 @@ function App() {
 
           <footer className="composer-wrap">
             {queuePosition > 0 ? <div className="queue-banner">Waiting in position {queuePosition}</div> : null}
+            {generating && queuePosition === 0 && generationStage ? <div className="queue-banner">{generationStage}</div> : null}
             {editingLastTurn ? <div className="edit-banner"><span>Editing your latest prompt</span><button onClick={() => { setEditingLastTurn(false); setPrompt(""); }}>Cancel</button></div> : null}
-            <div className="composer">
+            <form className="composer" onSubmit={submitPrompt}>
               <textarea
                 ref={composerRef}
                 value={prompt}
@@ -874,13 +931,15 @@ function App() {
                   <Square weight="fill" />
                 </IconButton>
               ) : (
-                <IconButton className="send-button" onClick={() => void sendPrompt()} disabled={!prompt.trim()} aria-label="Send message">
+                <IconButton className="send-button" type="submit" disabled={!prompt.trim()} aria-label="Send message">
                   <ArrowUp weight="bold" />
                 </IconButton>
               )}
+            </form>
+            <div className="composer-footnote">
+              <span>Verify important answers against cited sources.</span>
+              <span className="shortcut-hint"><kbd>Ctrl</kbd> + <kbd>K</kbd> focus · <kbd>Ctrl</kbd> + <kbd>N</kbd> new chat</span>
             </div>
-            <p>Gemma can make mistakes. Check the cited source.</p>
-            <p className="shortcut-hint"><kbd>Ctrl</kbd> + <kbd>K</kbd> focus · <kbd>Ctrl</kbd> + <kbd>N</kbd> new chat</p>
           </footer>
         </main>
 
@@ -1124,6 +1183,9 @@ function App() {
               <div key={user.id}>
                 <span><strong>{user.name}</strong><small>{user.role}</small></span>
                 <Badge color={user.active ? "jade" : "gray"}>{user.active ? "active" : "disabled"}</Badge>
+                {user.active && user.id !== currentUser?.id ? (
+                  <IconButton variant="ghost" onClick={() => void rotateKey(user)} aria-label={`Rotate API key for ${user.name}`} title="Rotate API key"><ArrowsClockwise /></IconButton>
+                ) : null}
               </div>
             ))}
           </div>

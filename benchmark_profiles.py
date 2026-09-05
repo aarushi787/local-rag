@@ -24,6 +24,11 @@ def main() -> None:
     parser.add_argument("--max-tokens", type=int, default=60)
     parser.add_argument("--document-id")
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
+    parser.add_argument(
+        "--profiles",
+        default="auto,fast,balanced,quality",
+        help="Comma-separated profile IDs to benchmark",
+    )
     args = parser.parse_args()
 
     api_key = os.getenv("RAG_API_KEY", "").strip()
@@ -31,9 +36,14 @@ def main() -> None:
         raise SystemExit("RAG_API_KEY is not configured in .env")
     headers = {"X-API-Key": api_key, "Content-Type": "application/json"}
 
-    profiles = requests.get(f"{args.base_url}/v1/profiles", timeout=15).json()["data"]
-    print("profile   model                   total_s  retrieval_s  generation_tok_s")
-    print("-------   ----------------------  -------  -----------  ----------------")
+    profile_response = requests.get(
+        f"{args.base_url}/v1/profiles", headers=headers, timeout=15
+    )
+    profile_response.raise_for_status()
+    selected = {value.strip() for value in args.profiles.split(",") if value.strip()}
+    profiles = [item for item in profile_response.json()["data"] if item["id"] in selected]
+    print("profile   model                   total_s  retrieval_s  embed_s  search_s  load_s  gen_tok_s")
+    print("-------   ----------------------  -------  -----------  -------  --------  ------  ---------")
     for profile in profiles:
         if not profile["available"]:
             print(f"{profile['id']:<9} {profile['model']:<22} unavailable")
@@ -46,6 +56,7 @@ def main() -> None:
                 "messages": [{"role": "user", "content": args.question}],
                 "stream": False,
                 "save": False,
+                "use_cache": False,
                 "max_tokens": args.max_tokens,
             }
             if args.document_id:
@@ -63,13 +74,23 @@ def main() -> None:
                 {
                     "total": time.perf_counter() - started,
                     "retrieval": (result.get("metrics", {}).get("retrieval_ms") or 0) / 1000,
+                    "embedding": (result.get("metrics", {}).get("query_embedding_ms") or 0) / 1000,
+                    "search": (result.get("metrics", {}).get("hybrid_search_ms") or 0) / 1000,
+                    "load": (result.get("metrics", {}).get("load_ms") or 0) / 1000,
                     "generation": result.get("metrics", {}).get("generation_tokens_per_second") or 0,
                 }
             )
         total = statistics.mean(item["total"] for item in measurements)
         retrieval = statistics.mean(item["retrieval"] for item in measurements)
+        embedding = statistics.mean(item["embedding"] for item in measurements)
+        search = statistics.mean(item["search"] for item in measurements)
+        load = statistics.mean(item["load"] for item in measurements)
         generation = statistics.mean(item["generation"] for item in measurements)
-        print(f"{profile['id']:<9} {profile['model']:<22} {total:>7.2f}  {retrieval:>11.2f}  {generation:>16.2f}")
+        print(
+            f"{profile['id']:<9} {profile['model']:<22} {total:>7.2f}  "
+            f"{retrieval:>11.2f}  {embedding:>7.2f}  {search:>8.2f}  "
+            f"{load:>6.2f}  {generation:>9.2f}"
+        )
 
 
 if __name__ == "__main__":

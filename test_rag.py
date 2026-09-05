@@ -184,6 +184,21 @@ class RerankingTests(unittest.TestCase):
         self.assertIn("Which publisher covered the expo?", query)
         self.assertIn("What date was it?", query)
 
+    def test_document_search_query_skips_conversation(self) -> None:
+        messages = [app.ChatMessage(role="user", content="Hello")]
+        self.assertEqual(app.document_search_query(messages), "NO_RETRIEVAL")
+
+    def test_document_search_query_preserves_follow_up_context(self) -> None:
+        messages = [
+            app.ChatMessage(role="user", content="Invoice INV-204 was issued on 2026-09-04."),
+            app.ChatMessage(role="assistant", content="Acknowledged."),
+            app.ChatMessage(role="user", content="What amount was it for?"),
+        ]
+        query = app.document_search_query(messages)
+        self.assertIn("INV-204", query)
+        self.assertIn("2026-09-04", query)
+        self.assertIn("What amount was it for?", query)
+
     def test_broad_questions_retrieve_more_evidence(self) -> None:
         self.assertEqual(app.retrieval_depth("List all publishers", 3), 5)
         self.assertEqual(app.retrieval_depth("Who published this?", 3), 3)
@@ -242,6 +257,48 @@ class RerankingTests(unittest.TestCase):
         self.assertTrue(app.is_summary_request("Summarize my uploaded document"))
         self.assertFalse(app.is_summary_request("Which model is used?"))
 
+    def test_retrieval_intent_routes_special_question_types(self) -> None:
+        self.assertEqual(app.retrieval_intent("Compare policy A versus policy B"), "comparison")
+        self.assertEqual(app.retrieval_intent("How many invoices are overdue?"), "aggregation")
+        self.assertEqual(app.retrieval_intent("Show invoice PG2473"), "exact_identifier")
+        self.assertEqual(app.retrieval_intent("Which model creates embeddings?"), "factual")
+
+    def test_query_expansion_adds_domain_synonyms(self) -> None:
+        expanded = app.expand_retrieval_query("What is the purpose of the vector database?")
+        self.assertIn("similarity search", expanded)
+        self.assertIn("relevant chunks", expanded)
+
+    def test_short_model_identifiers_are_kept_in_keyword_search(self) -> None:
+        self.assertIn("m3", app.lexical_tsquery("How many parameters does bge-m3 have?"))
+        self.assertIn("%bge-m3%", app.exact_identifier_patterns("Tell me about bge-m3"))
+
+    def test_context_enrichment_batches_selected_chunks(self) -> None:
+        executions: list[tuple[str, tuple]] = []
+
+        class Cursor:
+            def fetchall(self):
+                return [
+                    (1, "Policy", "Parent text", "Previous text", "Following text"),
+                    (2, "Rates", "Rate parent", None, None),
+                ]
+
+        class Connection:
+            def execute(self, sql, params):
+                executions.append((sql, params))
+                return Cursor()
+
+        @contextmanager
+        def fake_connection():
+            yield Connection()
+
+        rows = [{"id": 1, "content": "Current policy"}, {"id": 2, "content": "Current rate"}]
+        with patch.object(app, "db_connection", fake_connection):
+            enriched = app.enrich_retrieval_context(rows, "policy rate")
+        self.assertEqual(len(executions), 1)
+        self.assertEqual(executions[0][1], ([1, 2],))
+        self.assertIn("Current policy", enriched[0]["context_content"])
+        self.assertEqual(enriched[1]["section_title"], "Rates")
+
     def test_summary_prompt_treats_context_as_the_document(self) -> None:
         messages = [app.ChatMessage(role="user", content="Summarize my document")]
         rows = [{"source": "policy.pdf", "page_number": 1, "content": "Leave policy"}]
@@ -283,12 +340,22 @@ class ResponseProfileTests(unittest.TestCase):
         self.assertEqual(settings["model"], "custom-model")
         self.assertEqual(settings["max_tokens"], 75)
 
-    def test_auto_profile_routes_summary_to_quality(self) -> None:
+    def test_auto_profile_keeps_resident_model_when_routing_disabled(self) -> None:
         request = app.ChatCompletionRequest(
             messages=[app.ChatMessage(role="user", content="Summarize this policy")],
             profile="auto",
         )
         settings = app.response_settings(request, "Summarize this policy")
+        self.assertEqual(settings["profile"], "auto")
+        self.assertEqual(settings["model"], app.DEFAULT_CHAT_MODEL)
+
+    def test_auto_profile_can_route_when_explicitly_enabled(self) -> None:
+        request = app.ChatCompletionRequest(
+            messages=[app.ChatMessage(role="user", content="Summarize this policy")],
+            profile="auto",
+        )
+        with patch.object(app, "AUTO_MODEL_ROUTING", True):
+            settings = app.response_settings(request, "Summarize this policy")
         self.assertEqual(settings["profile"], "quality")
 
     def test_auto_profile_routes_normal_question_to_balanced(self) -> None:
@@ -413,13 +480,13 @@ class RagSecurityAndBehaviorTests(unittest.TestCase):
         self.assertIn("permission.user_id", sql)
         self.assertTrue(any(params and params.get("user_id") == principal.id for _, params in statements))
 
-    def test_cache_key_changes_when_document_checksum_changes(self) -> None:
+    def test_cache_key_changes_when_corpus_version_changes(self) -> None:
         class Cursor:
             def __init__(self, checksum):
                 self.checksum = checksum
 
-            def fetchall(self):
-                return [(self.checksum,)]
+            def fetchone(self):
+                return (self.checksum,)
 
         class Connection:
             def __init__(self, checksum):
@@ -439,9 +506,11 @@ class RagSecurityAndBehaviorTests(unittest.TestCase):
         )
         settings = app.response_settings(request)
         principal = app.Principal(uuid.uuid4(), "Reader", "user")
-        with patch.object(app, "db_connection", connection_for("a" * 64)):
+        app.CORPUS_STATE_CACHE = (0, 0.0)
+        with patch.object(app, "db_connection", connection_for(1)):
             first = app.cache_identity(request, "What is the policy?", settings, principal)
-        with patch.object(app, "db_connection", connection_for("b" * 64)):
+        app.CORPUS_STATE_CACHE = (0, 0.0)
+        with patch.object(app, "db_connection", connection_for(2)):
             second = app.cache_identity(request, "What is the policy?", settings, principal)
         self.assertNotEqual(first, second)
 
@@ -572,6 +641,70 @@ class RagSecurityAndBehaviorTests(unittest.TestCase):
         self.assertEqual(payload["citation_correctness"], 0.8)
         self.assertEqual(payload["unsupported_claim_rate"], 0.1)
         self.assertEqual(payload["cache_hit_rate"], 0.2)
+
+
+class HardeningReleaseTests(unittest.TestCase):
+    def test_csv_rows_are_structured_records(self) -> None:
+        parsed = extract_document(
+            b"Invoice,Amount,Status\nINV-1,1250,Paid\n",
+            "invoices.csv",
+            "text/csv",
+            Path.cwd(),
+        )
+        row = parsed.pages[0].blocks[0]
+        self.assertEqual(row.kind, "table_row")
+        self.assertEqual(row.metadata["values"]["Amount"], "1250")
+
+    def test_document_metadata_infers_version_and_department(self) -> None:
+        pages = [DocumentPage(1, "Finance policy Version 2.1 effective 2026-09-04")]
+        metadata = app.infer_document_metadata("finance-policy.docx", pages[0].text, pages)
+        self.assertEqual(metadata["department"], "finance")
+        self.assertEqual(metadata["document_version"], "2.1")
+        self.assertEqual(metadata["effective_date"], "2026-09-04")
+
+    def test_low_retrieval_confidence_closes_gate(self) -> None:
+        result = app.retrieval_confidence(
+            [{"similarity": 0.05, "rerank_score": 0.04}], "factual"
+        )
+        self.assertFalse(result["allow_answer"])
+
+    def test_grounding_validator_rejects_uncited_number(self) -> None:
+        result = app.validate_live_answer(
+            "The total is 99 units.",
+            [{"index": 1, "content": "The approved total is 42 units."}],
+            True,
+        )
+        self.assertFalse(result["valid"])
+
+    def test_model_allowlist_blocks_unapproved_model(self) -> None:
+        principal = app.Principal(
+            uuid.uuid4(), "Reader", "user", 30, 1, ("gemma3:1b-it-qat",)
+        )
+        with self.assertRaises(HTTPException) as raised:
+            app.enforce_model_access(principal, "gemma3:12b-it-qat")
+        self.assertEqual(raised.exception.status_code, 403)
+
+    def test_per_user_generation_limit_releases_slot(self) -> None:
+        principal = app.Principal(uuid.uuid4(), "Reader", "user", 30, 1, ())
+        with app.principal_generation_slot(principal):
+            with self.assertRaises(HTTPException) as raised:
+                with app.principal_generation_slot(principal):
+                    pass
+            self.assertEqual(raised.exception.status_code, 429)
+        self.assertNotIn(principal.id, app.USER_GENERATION_COUNTS)
+
+    def test_resource_breaker_does_not_block_after_hours(self) -> None:
+        with patch.object(app, "OFFICE_HOURS_POLICY", True), patch.object(
+            app, "office_hours_active", return_value=False
+        ), patch.object(app, "system_resource_snapshot") as snapshot:
+            result = app.ensure_generation_resources()
+        snapshot.assert_not_called()
+        self.assertEqual(result["status"], "outside_office_hours")
+
+    def test_database_pool_warmup_failure_keeps_process_alive(self) -> None:
+        with patch.object(app, "open_database_pool", side_effect=RuntimeError("offline")):
+            app.warm_database_pool()
+        self.assertEqual(app.DATABASE_POOL_STATE["status"], "degraded")
 
 
 if __name__ == "__main__":

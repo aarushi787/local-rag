@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import csv
 import json
 import os
 import subprocess
@@ -20,6 +21,9 @@ SUPPORTED_EXTENSIONS = {
 class TextBlock:
     text: str
     bbox: list[float] | None = None
+    confidence: float | None = None
+    kind: str = "text"
+    metadata: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass
@@ -48,6 +52,39 @@ def _decode_text(data: bytes) -> str:
         except UnicodeDecodeError:
             continue
     raise ValueError("The text file encoding is not supported")
+
+
+def _table_text(rows: list[list[object]], table_name: str) -> tuple[str, list[TextBlock]]:
+    normalized = [[str(value).strip() if value is not None else "" for value in row] for row in rows]
+    normalized = [row for row in normalized if any(row)]
+    if not normalized:
+        return "", []
+    width = max(len(row) for row in normalized)
+    first = normalized[0] + [""] * (width - len(normalized[0]))
+    headers = [value or f"Column {index}" for index, value in enumerate(first, start=1)]
+    blocks: list[TextBlock] = []
+    lines = [f"Table: {table_name}", "Columns: " + " | ".join(headers)]
+    for row_number, values in enumerate(normalized[1:], start=2):
+        padded = values + [""] * (width - len(values))
+        fields = [f"{header}: {value}" for header, value in zip(headers, padded) if value]
+        if not fields:
+            continue
+        text = f"Table Row {row_number} | " + " | ".join(fields)
+        raw_row = " | ".join(value for value in padded if value)
+        lines.append(f"{text}\nRaw Row: {raw_row}")
+        blocks.append(TextBlock(
+            text=text,
+            kind="table_row",
+            metadata={"table": table_name, "row_number": row_number, "values": dict(zip(headers, padded))},
+        ))
+    return "\n".join(lines), blocks
+
+
+def _extract_csv(data: bytes) -> list[DocumentPage]:
+    decoded = _decode_text(data)
+    rows = list(csv.reader(io.StringIO(decoded)))
+    text, blocks = _table_text(rows, "CSV")
+    return [DocumentPage(number=1, text=text or decoded.strip(), blocks=blocks or [TextBlock(text=decoded.strip())])]
 
 
 def _flatten_json(value: object, prefix: str = "") -> list[str]:
@@ -154,7 +191,12 @@ def _ocr_image(data: bytes, suffix: str, page_number: int, project_dir: Path) ->
         payload = json.loads(json_path.read_text(encoding="utf-8"))
 
     blocks = [
-        TextBlock(text=item["text"], bbox=item.get("bbox"))
+        TextBlock(
+            text=item["text"],
+            bbox=item.get("bbox"),
+            confidence=item.get("confidence", item.get("score")),
+            kind="ocr_line",
+        )
         for item in payload.get("lines", [])
         if item.get("text", "").strip()
     ]
@@ -210,13 +252,17 @@ def _extract_docx(data: bytes) -> list[DocumentPage]:
 
     document = Document(io.BytesIO(data))
     parts = [paragraph.text.strip() for paragraph in document.paragraphs if paragraph.text.strip()]
-    for table in document.tables:
-        for row in table.rows:
-            cells = [cell.text.strip() for cell in row.cells]
-            if any(cells):
-                parts.append(" | ".join(cells))
+    table_blocks: list[TextBlock] = []
+    for table_number, table in enumerate(document.tables, start=1):
+        table_text, blocks = _table_text(
+            [[cell.text.strip() for cell in row.cells] for row in table.rows],
+            f"Word table {table_number}",
+        )
+        if table_text:
+            parts.append(table_text)
+            table_blocks.extend(blocks)
     text = "\n".join(parts)
-    return [DocumentPage(number=1, text=text, blocks=[TextBlock(text=text)] if text else [])]
+    return [DocumentPage(number=1, text=text, blocks=table_blocks or ([TextBlock(text=text)] if text else []))]
 
 
 def _extract_xlsx(data: bytes) -> list[DocumentPage]:
@@ -226,19 +272,13 @@ def _extract_xlsx(data: bytes) -> list[DocumentPage]:
     pages: list[DocumentPage] = []
     try:
         for sheet_number, sheet in enumerate(workbook.worksheets, start=1):
-            lines = [f"Sheet: {sheet.title}"]
-            for row in sheet.iter_rows(values_only=True):
-                values = [str(value).strip() if value is not None else "" for value in row]
-                while values and not values[-1]:
-                    values.pop()
-                if any(values):
-                    lines.append(" | ".join(values))
-            text = "\n".join(lines)
+            text, blocks = _table_text(list(sheet.iter_rows(values_only=True)), sheet.title)
+            text = f"Sheet: {sheet.title}\n{text}" if text else f"Sheet: {sheet.title}"
             pages.append(
                 DocumentPage(
                     number=sheet_number,
                     text=text,
-                    blocks=[TextBlock(text=text)],
+                    blocks=blocks or [TextBlock(text=text)],
                 )
             )
     finally:
@@ -259,7 +299,9 @@ def extract_document(
 
     if extension == ".json":
         pages = _extract_json(data)
-    elif extension in {".txt", ".md", ".csv"}:
+    elif extension == ".csv":
+        pages = _extract_csv(data)
+    elif extension in {".txt", ".md"}:
         text = _decode_text(data).strip()
         pages = [DocumentPage(number=1, text=text, blocks=[TextBlock(text=text)] if text else [])]
     elif extension == ".docx":

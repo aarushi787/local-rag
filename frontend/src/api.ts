@@ -15,6 +15,14 @@ export type Source = {
 
 export type Metrics = {
   retrieval_ms?: number;
+  cache_lookup_ms?: number;
+  query_embedding_ms?: number;
+  hybrid_search_ms?: number;
+  rerank_mmr_ms?: number;
+  context_enrichment_ms?: number;
+  context_packing_ms?: number;
+  intent?: string;
+  load_ms?: number;
   first_token_ms?: number | null;
   generation_tokens_per_second?: number | null;
   prompt_tokens_per_second?: number | null;
@@ -44,7 +52,7 @@ export type Health = {
   warmup?: { status: string; models: string[]; error?: string | null };
   query_cache?: { entries: number; capacity: number };
   ollama?: { status: string; models?: number; error?: string };
-  neon?: { status: string; stored_documents?: number; stored_chunks?: number; error?: string };
+  database?: { status: string; stored_documents?: number; stored_chunks?: number; error?: string };
 };
 
 export type ConversationSummary = {
@@ -234,6 +242,12 @@ export const createUser = (name: string, role: "admin" | "user") =>
     body: JSON.stringify({ name, role })
   });
 
+export const rotateUserKey = (id: string) =>
+  requestJson<{ id: string; name: string; api_key: string; notice: string }>(
+    `/v1/users/${id}/rotate-key`,
+    { method: "POST" }
+  );
+
 export const setDocumentPermission = (documentId: string, userId: string) =>
   requestJson(`/v1/documents/${documentId}/permissions`, {
     method: "PUT",
@@ -283,6 +297,7 @@ export const cancelChat = (requestId: string) =>
 
 type StreamCallbacks = {
   onQueue: (requestId: string, position: number) => void;
+  onStatus: (stage: string, message: string) => void;
   onStart: (conversationId: string | null, sources: Source[], model?: string) => void;
   onToken: (token: string) => void;
   onComplete: (sources: Source[], metrics: Metrics, finishReason: string) => void;
@@ -339,6 +354,10 @@ export async function streamChat(
       if (event.error) throw new ApiError(500, event.error.message || "Streaming failed");
       if (event.object === "rag.queue") {
         callbacks.onQueue(event.id, event.position || 0);
+        continue;
+      }
+      if (event.object === "rag.status") {
+        callbacks.onStatus(event.stage || "working", event.message || "Working");
         continue;
       }
       if (event.sources && event.choices?.[0]?.delta?.role) {

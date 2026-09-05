@@ -21,3 +21,6 @@ training-data/
 training-output/
 models/*.gguf
 models/*.safetensors
+server-build/artifacts/
+local-infrastructure/.env
+backups/
