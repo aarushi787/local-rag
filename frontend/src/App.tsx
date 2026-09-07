@@ -154,7 +154,7 @@ function App() {
   const [documentFilter, setDocumentFilter] = useState("all");
   const [dragActive, setDragActive] = useState(false);
   const [editingLastTurn, setEditingLastTurn] = useState(false);
-  const [expandedSource, setExpandedSource] = useState<number | null>(null);
+  const [expandedSource, setExpandedSource] = useState<number | string | null>(null);
   const [renameTarget, setRenameTarget] = useState<ConversationSummary | null>(null);
   const [renameTitle, setRenameTitle] = useState("");
   const [deleteTarget, setDeleteTarget] = useState<{ type: "conversation" | "document"; id: string; name: string } | null>(null);
@@ -882,8 +882,9 @@ function App() {
                           <button onClick={regenerateLastResponse}><ArrowCounterClockwise /> Regenerate</button>
                         ) : null}
                         {message.metrics.cache_hit ? <span>Cached response</span> : null}
+                        {message.metrics.grounding_validation?.blocked_original_answer ? <span role="status">Answer withheld after citation check</span> : message.metrics.grounding_validation?.refusal ? <span role="status">Insufficient evidence</span> : null}
                         {message.metrics.generation_tokens_per_second ? <span>{message.metrics.generation_tokens_per_second} tokens/sec</span> : null}
-                        {message.metrics.first_token_ms ? <span>{Math.round(message.metrics.first_token_ms)} ms first token</span> : null}
+                        {message.metrics.first_token_ms ? <span>{Math.round(message.metrics.first_token_ms)} ms to displayed answer</span> : null}
                         {message.metrics.total_ms ? <span>{(message.metrics.total_ms / 1000).toFixed(1)} sec total</span> : null}
                         {currentUser?.role === "admin" && message.metrics.retrieval_ms ? <span>{Math.round(message.metrics.retrieval_ms)} ms retrieval</span> : null}
                       </div>
@@ -892,7 +893,7 @@ function App() {
                       <div className="citation-row">
                         {message.sources.slice(0, 4).map((source) => (
                           <button key={source.id} onClick={() => setActiveSources(message.sources)}>
-                            {source.index} <span>{source.filename} · p.{source.page_number || 1} · {Math.round(source.rerank_score * 100)}%</span>
+                            {source.index} <span>{source.filename}{source.page_number ? ` · p.${source.page_number}` : " · page unavailable"}</span>
                           </button>
                         ))}
                       </div>
@@ -954,11 +955,11 @@ function App() {
                 <article key={source.id}>
                   <button className="source-summary" onClick={() => setExpandedSource(expandedSource === source.id ? null : source.id)} aria-expanded={expandedSource === source.id}>
                     <span>{source.index}</span>
-                    <div><strong>{source.filename}</strong><small>Page {source.page_number || 1}{source.section_title ? ` · ${source.section_title}` : ""} · chunk {source.chunk_index || source.index}</small></div>
-                    <b>{Math.round(source.rerank_score * 100)}%</b>
+                    <div><strong>{source.filename}</strong><small>{source.page_number ? `Page ${source.page_number}` : "Page unavailable"}{source.section_title ? ` · ${source.section_title}` : ""} · chunk {source.chunk_index || source.index}</small></div>
+                    <b>Source</b>
                   </button>
                   {expandedSource === source.id ? (
-                    <div className="source-detail"><p>{source.quote}</p><div className="source-score">Relevance {Math.round(source.rerank_score * 100)}%</div></div>
+                    <div className="source-detail"><p>{source.evidence_text || source.quote}</p>{currentUser?.role === "admin" ? <div className="source-score">Ranking score (uncalibrated): {source.rerank_score.toFixed(3)} — not a probability of correctness</div> : null}</div>
                   ) : null}
                 </article>
               ))}

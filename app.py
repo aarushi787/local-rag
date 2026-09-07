@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -38,6 +39,7 @@ from pgvector.psycopg import register_vector
 from psycopg_pool import ConnectionPool
 from pydantic import BaseModel, Field
 
+from rag_core.grounding import validate_answer, is_refusal, REFUSAL
 from document_processing import DocumentPage, extract_document, union_bbox
 from inference_queue import (
     InferenceCancelledError,
@@ -59,6 +61,8 @@ AUTO_MODEL_ROUTING = os.getenv("AUTO_MODEL_ROUTING", "false").lower() in {
 }
 RAG_TOP_K = int(os.getenv("RAG_TOP_K", "3"))
 RAG_CANDIDATES = int(os.getenv("RAG_CANDIDATES", "15"))
+RRF_K = max(1, int(os.getenv("RRF_K", "60")))
+CACHE_CONTRACT_VERSION = "grounding-cache-v3"
 RAG_MIN_SIMILARITY = float(os.getenv("RAG_MIN_SIMILARITY", "0.30"))
 RERANK_ENABLED = os.getenv("RERANK_ENABLED", "true").lower() in {"1", "true", "yes"}
 SUMMARY_MAX_CHUNKS = int(os.getenv("SUMMARY_MAX_CHUNKS", "12"))
@@ -137,7 +141,7 @@ API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
 # exhausting the laptop's limited system memory.
 MODEL_GATE = InferenceQueue(MAX_QUEUED_REQUESTS, QUEUE_WAIT_SECONDS)
 INGESTION_GATE = threading.BoundedSemaphore(max(1, INGESTION_WORKERS))
-CANCEL_EVENTS: dict[str, threading.Event] = {}
+CANCEL_EVENTS: dict[str, tuple[uuid.UUID, threading.Event]] = {}
 CANCEL_EVENTS_LOCK = threading.Lock()
 DB_POOL: ConnectionPool | None = None
 RATE_LIMIT_BUCKETS: dict[str, deque[float]] = {}
@@ -1831,8 +1835,8 @@ def retrieve(
                 COALESCE(v.similarity, k.similarity) AS similarity,
                 v.vector_rank,
                 k.keyword_rank,
-                COALESCE(1.0 / (60 + v.vector_rank), 0) +
-                COALESCE(1.0 / (60 + k.keyword_rank), 0) AS hybrid_score
+                COALESCE(1.0 / (%(rrf_k)s + v.vector_rank), 0) +
+                COALESCE(1.0 / (%(rrf_k)s + k.keyword_rank), 0) AS hybrid_score
             FROM vector_ranked v
             FULL OUTER JOIN keyword_ranked k USING (id)
         )
@@ -1848,6 +1852,7 @@ def retrieve(
         "embedding_model": EMBEDDING_MODEL,
         "question": question,
         "keyword_query": keyword_query,
+        "rrf_k": RRF_K,
         "candidates": candidate_count,
         "minimum_similarity": RAG_MIN_SIMILARITY,
         "document_id": document_id,
@@ -2368,14 +2373,17 @@ def cross_encoder_rerank(question: str, rows: list[dict]) -> list[dict]:
             scores = [item.get("score") for item in payload["results"]]
         if not isinstance(scores, list) or len(scores) != len(rows):
             raise ValueError("reranker response must provide one score per document")
-        for row, score in zip(rows, scores, strict=True):
-            row["cross_encoder_score"] = float(score)
+        numeric_scores = [float(score) for score in scores]
+        if not all(math.isfinite(score) for score in numeric_scores):
+            raise ValueError("reranker scores must be finite")
+        rows = [dict(row, cross_encoder_score=score)
+                for row, score in zip(rows, numeric_scores, strict=True)]
         rows.sort(
             key=lambda row: (row.get("cross_encoder_score", 0.0), row.get("rerank_score", 0.0)),
             reverse=True,
         )
     except Exception as exc:
-        LOGGER.warning("Cross-encoder unavailable; using heuristic reranker: %s", error_detail(exc))
+        LOGGER.warning("Cross-encoder unavailable; using heuristic reranker: %s", type(exc).__name__)
     return rows
 
 
@@ -2490,12 +2498,15 @@ def enrich_retrieval_context(rows: list[dict], question: str = "") -> list[dict]
                    previous.content, following.content
             FROM rag_chunks current
             LEFT JOIN rag_chunk_parents p ON p.id = current.parent_id
+             AND p.page_number IS NOT DISTINCT FROM current.page_number
             LEFT JOIN rag_chunks previous
               ON previous.document_id = current.document_id
              AND previous.chunk_index = current.chunk_index - 1
+             AND previous.page_number IS NOT DISTINCT FROM current.page_number
             LEFT JOIN rag_chunks following
               ON following.document_id = current.document_id
              AND following.chunk_index = current.chunk_index + 1
+             AND following.page_number IS NOT DISTINCT FROM current.page_number
             WHERE current.id = ANY(%s)
             """,
             ([row["id"] for row in rows],),
@@ -2531,70 +2542,20 @@ def source_payload(rows: list[dict]) -> list[dict]:
             "filename": row.get("filename", row["source"]),
             "page_number": row["page_number"],
             "chunk_index": row.get("chunk_index"),
-            "bbox": row.get("bbox"),
+            "bbox": row.get("bbox") if row.get("context_content", row["content"]) == row["content"] else None,
             "section_title": row.get("section_title"),
             "similarity": round(row["similarity"], 4),
             "rerank_score": round(row.get("rerank_score", 0), 4),
             "quote": row.get("context_content", row["content"])[:500],
+            # Exact packed evidence, not the shortened UI preview, is validated.
+            "evidence_text": row.get("context_content", row["content"]),
         }
         for index, row in enumerate(rows, start=1)
     ]
 
 
 def validate_live_answer(answer: str, sources: list[dict], grounded: bool = True) -> dict[str, object]:
-    """Conservatively check citation presence, indexes, lexical support, and numbers."""
-    if not grounded:
-        return {"valid": True, "applicable": False, "support_rate": 1.0,
-                "invalid_citations": [], "uncited_claims": []}
-    normalized = " ".join(answer.lower().split())
-    if any(phrase in normalized for phrase in (
-        "i couldn't find that information in the available documents",
-        "i don't know from the supplied documents",
-    )):
-        return {"valid": True, "applicable": True, "support_rate": 1.0,
-                "invalid_citations": [], "uncited_claims": []}
-
-    invalid_citations: list[int] = []
-    uncited_claims: list[str] = []
-    cited_claims = supported_claims = 0
-    for claim in re.split(r"(?<=[.!?])\s+|\n+", answer):
-        clean_claim = claim.strip(" -*#\t")
-        if not clean_claim:
-            continue
-        indexes = [int(value) for value in re.findall(r"\[source\s+(\d+)\]", clean_claim, re.IGNORECASE)]
-        statement = re.sub(r"\[source\s+\d+\]", "", clean_claim, flags=re.IGNORECASE).strip()
-        terms = _terms(statement)
-        looks_factual = len(terms) >= 4 or bool(re.search(r"\b\d", statement))
-        if looks_factual and not indexes:
-            uncited_claims.append(statement[:180])
-            continue
-        if not indexes:
-            continue
-        cited_claims += 1
-        if any(index < 1 or index > len(sources) for index in indexes):
-            invalid_citations.extend(index for index in indexes if index < 1 or index > len(sources))
-            continue
-        claim_numbers = set(re.findall(r"\b\d[\d,./:%-]*\b", statement))
-        supported = False
-        for index in indexes:
-            evidence = str(sources[index - 1].get("quote", ""))
-            evidence_terms = _terms(evidence)
-            overlap = len(terms & evidence_terms) / max(len(terms), 1)
-            evidence_numbers = set(re.findall(r"\b\d[\d,./:%-]*\b", evidence))
-            if overlap >= 0.20 and (not claim_numbers or claim_numbers <= evidence_numbers):
-                supported = True
-                break
-        supported_claims += int(supported)
-    support_rate = supported_claims / cited_claims if cited_claims else 0.0
-    valid = not invalid_citations and not uncited_claims and cited_claims > 0 and support_rate == 1.0
-    return {
-        "valid": valid,
-        "applicable": True,
-        "support_rate": round(support_rate, 4),
-        "invalid_citations": sorted(set(invalid_citations)),
-        "uncited_claims": uncited_claims[:5],
-    }
-
+    return validate_answer(answer, sources, grounded)
 
 def pack_context_rows(rows: list[dict], num_ctx: int) -> list[dict]:
     """Keep the best evidence inside the selected model's practical context budget."""
@@ -2717,6 +2678,9 @@ def bounded_history(messages: list[ChatMessage]) -> list[dict]:
     selected: list[dict] = []
     characters = 0
     for item in reversed(messages):
+        # Callers cannot add privileged instructions after the server contract.
+        if item.role == "system":
+            continue
         if len(selected) >= MAX_HISTORY_MESSAGES:
             break
         remaining = MAX_HISTORY_CHARS - characters
@@ -2762,35 +2726,44 @@ def cache_identity(
     settings: dict[str, object],
     principal: Principal,
 ) -> tuple[str, str] | None:
-    if not request.use_cache or sum(message.role == "user" for message in request.messages) != 1:
+    if not request.use_cache or len(request.messages) != 1 or request.messages[0].role != "user":
         return None
     if request.document_id:
         with db_connection() as conn:
             row = conn.execute(
                 """
-                SELECT checksum_sha256 FROM rag_documents d
-                WHERE d.id = %s AND (%s OR EXISTS (
+                SELECT checksum_sha256, state.version FROM rag_documents d
+                CROSS JOIN rag_corpus_state state
+                WHERE d.id = %s AND state.id = 1 AND (%s OR EXISTS (
                     SELECT 1 FROM rag_document_permissions p
                     WHERE p.document_id = d.id AND p.user_id = %s AND p.can_read
                 ))
                 """,
                 (request.document_id, principal.is_admin, principal.id),
             ).fetchone()
-        version_material = f"document:{row[0]}" if row else "document:unavailable"
+        if not row:
+            return None  # No cached answer for an inaccessible document.
+        version_material = f"document:{request.document_id}:{row[0]}:corpus:{row[1]}"
     else:
-        version_material = f"corpus:{current_corpus_version()}"
+        version_material = f"corpus:{current_corpus_version(force_refresh=True)}"
 
     # The principal is part of the fingerprint so cached evidence can never cross
     # an account boundary even when two accounts currently share the same corpus.
     fingerprint = hashlib.sha256(
-        f"{version_material}|principal:{principal.id}".encode()
+        f"{version_material}|principal:{principal.id}|role:{principal.role}".encode()
     ).hexdigest()
     normalized = " ".join(question.lower().split())
     question_hash = hashlib.sha256(normalized.encode()).hexdigest()
     material = "|".join(
         [
+            CACHE_CONTRACT_VERSION,
             RAG_PIPELINE_VERSION,
             RAG_PROMPT_VERSION,
+            json.dumps(ollama_options(request, settings), sort_keys=True),
+            json.dumps(settings, sort_keys=True, default=str),
+            str((RRF_K, RAG_CANDIDATES, RAG_MIN_SIMILARITY, RERANK_ENABLED,
+                 CROSS_ENCODER_URL, MMR_LAMBDA, RAG_CONFIDENCE_MIN,
+                 CONFIDENCE_GATE_ENABLED, STRICT_CITATION_GATE)),
             question_hash,
             fingerprint,
             str(settings["model"]),
@@ -2800,15 +2773,15 @@ def cache_identity(
     return hashlib.sha256(material.encode()).hexdigest(), fingerprint
 
 
-def current_corpus_version() -> int:
+def current_corpus_version(force_refresh: bool = False) -> int:
     global CORPUS_STATE_CACHE
     now = time.monotonic()
     version, expires_at = CORPUS_STATE_CACHE
-    if expires_at > now:
+    if not force_refresh and expires_at > now:
         return version
     with CORPUS_STATE_LOCK:
         version, expires_at = CORPUS_STATE_CACHE
-        if expires_at > time.monotonic():
+        if not force_refresh and expires_at > time.monotonic():
             return version
         with db_connection() as conn:
             row = conn.execute(
@@ -2841,7 +2814,8 @@ def get_cached_answer(cache_key: str) -> dict | None:
     with db_connection() as conn:
         row = conn.execute(
             """
-            SELECT answer, sources, metrics FROM rag_answer_cache
+            SELECT answer, sources, metrics,
+                   EXTRACT(EPOCH FROM (expires_at - NOW())) FROM rag_answer_cache
             WHERE cache_key = %s AND expires_at > NOW()
             """,
             (cache_key,),
@@ -2849,20 +2823,20 @@ def get_cached_answer(cache_key: str) -> dict | None:
     if not row:
         return None
     metrics = dict(row[2] or {})
-    metrics.update(cache_hit=True, cache_layer="postgresql", total_ms=0.0, retrieval_ms=0.0)
+    metrics.update(cache_hit=True, cache_layer="postgresql")
     cached = {"answer": row[0], "sources": row[1] or [], "metrics": metrics}
-    remember_answer(cache_key, cached)
+    remember_answer(cache_key, cached, ttl_seconds=max(0.0, float(row[3])))
     return cached
 
 
-def remember_answer(cache_key: str, cached: dict) -> None:
+def remember_answer(cache_key: str, cached: dict, ttl_seconds: float | None = None) -> None:
     if MEMORY_ANSWER_CACHE_SIZE <= 0:
         return
     with MEMORY_ANSWER_CACHE_LOCK:
         if len(MEMORY_ANSWER_CACHE) >= MEMORY_ANSWER_CACHE_SIZE:
             MEMORY_ANSWER_CACHE.pop(next(iter(MEMORY_ANSWER_CACHE)), None)
         MEMORY_ANSWER_CACHE[cache_key] = (
-            time.monotonic() + ANSWER_CACHE_TTL_SECONDS,
+            time.monotonic() + min(ANSWER_CACHE_TTL_SECONDS, ttl_seconds if ttl_seconds is not None else ANSWER_CACHE_TTL_SECONDS),
             {**cached, "metrics": dict(cached.get("metrics", {}))},
         )
 
@@ -3864,64 +3838,24 @@ def collect_evaluation_answer(question: str, principal: Principal) -> dict:
 
 
 def score_generated_answer(example: dict, answer: str, sources: list[dict]) -> dict:
-    normalized = " ".join(answer.lower().split())
-    refusal = any(
-        phrase in normalized
-        for phrase in (
-            "i don't know from the supplied documents",
-            "i couldn't find that information in the available documents",
-        )
-    )
-    should_refuse = bool(example.get("should_refuse", False))
-    citations = [int(value) for value in re.findall(r"\[source\s+(\d+)\]", answer, re.IGNORECASE)]
-    valid_indexes = bool(citations) and all(1 <= value <= len(sources) for value in citations)
-
-    supported_claims = 0
-    cited_claims = 0
-    if valid_indexes:
-        for claim in re.split(r"(?<=[.!?])\s+|\n+", answer):
-            claim_citations = [
-                int(value) for value in re.findall(r"\[source\s+(\d+)\]", claim, re.IGNORECASE)
-            ]
-            if not claim_citations:
-                continue
-            cited_claims += 1
-            claim_without_citations = re.sub(r"\[source\s+\d+\]", "", claim, flags=re.IGNORECASE)
-            claim_terms = _terms(claim_without_citations)
-            claim_numbers = set(re.findall(r"\b\d[\d,./:-]*\b", claim_without_citations))
-            supported = False
-            for source_index in claim_citations:
-                source_text = str(sources[source_index - 1].get("quote", ""))
-                if not source_text:
-                    supported = True  # Legacy evaluation payloads do not include quotes.
-                    break
-                source_terms = _terms(source_text)
-                lexical_support = len(claim_terms & source_terms) / max(len(claim_terms), 1)
-                number_support = not claim_numbers or claim_numbers <= set(
-                    re.findall(r"\b\d[\d,./:-]*\b", source_text)
-                )
-                if lexical_support >= 0.25 and number_support:
-                    supported = True
-                    break
-            supported_claims += int(supported)
-    citation_support_rate = supported_claims / cited_claims if cited_claims else 0.0
-    citation_correct = (
-        not citations if should_refuse
-        else valid_indexes and citation_support_rate == 1.0
-    )
-    required_facts = example.get("required_facts", example.get("expected_terms", []))
-    facts_present = all(str(fact).lower() in normalized for fact in required_facts)
-    refusal_correct = refusal == should_refuse
-    grounded = refusal_correct if should_refuse else (facts_present and citation_correct and not refusal)
-    unsupported_claim = bool(answer.strip()) and not should_refuse and not citation_correct
+    """Compatibility metrics are lexical proxies, not human faithfulness."""
+    normalized = " ".join(answer.casefold().split())
+    refusal = is_refusal(answer)
+    expected_refusal = bool(example.get("should_refuse", False))
+    validation = validate_live_answer(answer, sources)
+    required = example.get("required_facts", example.get("expected_terms", []))
+    facts_present = all(str(f).casefold() in normalized for f in required)
+    forbidden = any(str(f).casefold() in normalized for f in example.get("forbidden_claims", []))
+    citation_correct = bool(validation["valid"]) and not refusal
+    refusal_correct = refusal == expected_refusal
     return {
-        "citation_correct": citation_correct,
-        "grounded": grounded,
-        "unsupported_claim": unsupported_claim,
+        "citation_correct": (not validation["claims"]) if expected_refusal and refusal else citation_correct,
+        "grounded": refusal if expected_refusal else (citation_correct and facts_present and not forbidden),
+        "unsupported_claim": any(not c["supported"] for c in validation["claims"]) or forbidden,
         "refusal_correct": refusal_correct,
-        "citation_support_rate": round(citation_support_rate, 4),
+        "citation_support_rate": validation["support_rate"] if not refusal else 0.0,
+        "metric_method": "lexical_proxy_not_human_faithfulness",
     }
-
 
 def run_retrieval_evaluation(
     run_id: uuid.UUID,
@@ -4202,7 +4136,7 @@ def streaming_chat(request: ChatCompletionRequest, principal: Principal) -> Iter
     cancelled = False
     cancel_event = threading.Event()
     with CANCEL_EVENTS_LOCK:
-        CANCEL_EVENTS[completion_id] = cancel_event
+        CANCEL_EVENTS[completion_id] = (principal.id, cancel_event)
 
     def event(payload: dict) -> str:
         return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
@@ -4302,7 +4236,7 @@ def streaming_chat(request: ChatCompletionRequest, principal: Principal) -> Iter
             )
             sources = source_payload(rows)
             buffer_for_validation = bool(
-                STRICT_CITATION_GATE and grounded and settings.get("profile") == "quality"
+                STRICT_CITATION_GATE and grounded
             )
 
             yield event({
@@ -4402,7 +4336,7 @@ def streaming_chat(request: ChatCompletionRequest, principal: Principal) -> Iter
             metrics["first_token_ms"] = (
                 round(first_token_ms, 2) if first_token_ms is not None else None
             )
-            if content_parts:
+            if content_parts and not cancelled:
                 if cache_descriptor:
                     store_cached_answer(
                         cache_descriptor[0], cache_descriptor[1], question, settings,
@@ -4509,13 +4443,13 @@ def metrics_summary(
     }
 
 
-@app.post("/v1/chat/cancel/{request_id}", dependencies=[Depends(require_api_key)])
-def cancel_chat(request_id: str) -> dict:
+@app.post("/v1/chat/cancel/{request_id}")
+def cancel_chat(request_id: str, principal: Principal = Depends(require_api_key)) -> dict:
     with CANCEL_EVENTS_LOCK:
-        cancel_event = CANCEL_EVENTS.get(request_id)
-    if not cancel_event:
+        active = CANCEL_EVENTS.get(request_id)
+    if not active or active[0] != principal.id:
         raise HTTPException(status_code=404, detail="active request not found")
-    cancel_event.set()
+    active[1].set()
     return {"cancelled": True, "request_id": request_id}
 
 
@@ -4631,7 +4565,6 @@ def chat_completions(
     if (
         STRICT_CITATION_GATE
         and grounded
-        and settings.get("profile") == "quality"
         and not grounding_validation["valid"]
     ):
         answer = "I couldn't find that information in the available documents."

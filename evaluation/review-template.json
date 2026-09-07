@@ -1,0 +1,18 @@
+{
+  "id": "REPLACE_WITH_STABLE_ID",
+  "category": "factual",
+  "question": "",
+  "expected_documents": [],
+  "expected_pages": [],
+  "required_facts": [],
+  "forbidden_claims": [],
+  "should_refuse": false,
+  "answer_notes": "",
+  "difficulty": "easy",
+  "review": {
+    "status": "draft",
+    "reviewer": "",
+    "reviewed_at": "",
+    "item_sha256": ""
+  }
+}

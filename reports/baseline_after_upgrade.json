@@ -1,0 +1,23 @@
+{
+  "phase": "after",
+  "date": "2026-09-07",
+  "status": "candidate_not_production_ready",
+  "unit_tests": {"passed": 87, "failed": 0, "seconds": 1.514},
+  "frontend_build": {"passed": true, "vite_seconds": 45.21},
+  "compileall": "passed",
+  "diff_whitespace_check": "passed",
+  "local_restore_target_guard": "loopback accepted; remote rejected",
+  "live_benchmark": {"status": "blocked", "available_ram_gib": 1.081, "minimum_pre_request_ram_gib": 2.0},
+  "regression_probes": {"mixed_refusal_bypass": false, "late_evidence_rejected": false, "uncited_extra_claim_ignored": false, "client_system_role_privileged": false, "output_budget_cache_collision": false},
+  "retrieval_latency_p50_ms": null,
+  "retrieval_latency_p95_ms": null,
+  "generation_latency_p95_ms": null,
+  "human_grounded_accuracy": null,
+  "refusal_precision": null,
+  "refusal_recall": null,
+  "two_user_live_acceptance": null,
+  "migration": "not_run_tools_unavailable",
+  "remote_database_mutations": false,
+  "embedding_promoted": false,
+  "services_restarted": false
+}

@@ -1,5 +1,7 @@
 # Local RAG API
 
+> **New user?** See [Setup and access from any device](USER_SETUP_GUIDE.md) for browser access, personal keys, private remote/LAN access, Windows installation and troubleshooting. The guide distinguishes the current custom app from the separate Open WebUI build kit.
+
 > **Xeon server deployment:** The guarded Windows Server 2025 build kit for
 > Ollama + Open WebUI is in [`server-build/`](server-build/README.md). It is
 > intentionally isolated from this laptop application because the two stacks

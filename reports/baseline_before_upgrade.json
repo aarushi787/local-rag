@@ -1,0 +1,33 @@
+{
+  "phase": "before",
+  "captured_at": "2026-09-05T22:45:49+0530",
+  "commit": "33c1349582356fe61e21a2262983022457dc7b37",
+  "provenance": "Summary of completed read-only benchmark tool output, recorded before source edits. Raw per-request output remains in task history.",
+  "dataset_sha256": "3a237ed96762fc2ff3b2015579907785abf334e40df5dfcb3ee7b481a523aace",
+  "dataset_count": 21,
+  "human_review": "unverified legacy dataset",
+  "unit_tests": {"passed": 62, "failed": 0, "seconds": 1.42},
+  "frontend_build": {"passed": true, "seconds": 31.29},
+  "database": {"transaction_read_only": "on", "documents": 514, "chunks": 5190, "corpus_version": 944, "corpus_version_end": 944},
+  "retrieval": {
+    "vector_only": {"answerable_n": 20, "hit_at_1": 0.75, "hit_at_3": 0.8, "hit_at_5": 0.9, "mrr": 0.7975, "evidence_hit": 0.9, "latency_n": 21, "p50_ms": 1748.07, "p95_ms": 3482.41},
+    "existing_hybrid": {"answerable_n": 20, "hit_at_1": 1, "hit_at_3": 1, "hit_at_5": 1, "mrr": 1, "evidence_hit": 1, "latency_n": 21, "p50_ms": 3713.68, "p95_ms": 4674.39}
+  },
+  "profiles": {
+    "auto": {"model": "gemma3:1b-it-qat", "first_text_ms": [17663.74, 4190.79, 3518.77], "total_ms": [18489.37, 4691.86, 4116.25], "generation_tokens_per_second": [11.09, 17.98, 15.03], "p50_ms": 4691.86, "p95_ms": 18489.37, "legacy_grounded_passes": 0},
+    "fast": {"model": "gemma3:1b-it-qat", "first_text_ms": [22679.54, 4585.12, 5734.72], "total_ms": [32189.87, 6341.63, 7354.94], "generation_tokens_per_second": [2.44, 13.43, 14.2], "p50_ms": 7354.94, "p95_ms": 32189.87, "legacy_grounded_passes": 0},
+    "balanced": {"model": "qwen3:1.7b", "status": "unavailable"},
+    "quality": {"model": "gemma3:1b-it-qat", "first_text_ms": [24806.82, 8029.35, 5231.94], "total_ms": [24807.32, 8029.92, 5232.46], "generation_tokens_per_second": [9.24, 15.83, 12.87], "p50_ms": 8029.92, "p95_ms": 24807.32, "legacy_grounded_passes": 0}
+  },
+  "resources": {"total_ram_gib": 7.326, "minimum_available_ram_gib": 0.015, "cpu_p50_percent": 26.45, "cpu_p95_percent": 92.4, "samples": 488, "ollama_chat_bytes": 1075933346, "ollama_embedding_bytes": 680379023},
+  "regression_probes": {"mixed_refusal_bypass": true, "late_evidence_rejected": true, "uncited_extra_claim_ignored": true, "client_system_role_privileged": true, "output_budget_cache_collision": true},
+  "unmeasured": {"human_faithfulness": null, "citation_precision": null, "citation_recall": null, "refusal_precision": null, "refusal_recall": null, "ndcg": null, "precision_at_k": null, "cache_hit_rate": null, "two_user_concurrency": null},
+  "limitations": [
+    "Retrieval uses legacy single-document hit proxies, not a complete relevance judgment set.",
+    "Generation repeats one answerable question three times per installed profile; not representative generation or refusal evaluation.",
+    "Direct Python functions exclude HTTP/authentication latency. Caches and conversation saving disabled. No remote writes.",
+    "Small-sample nearest-rank p95 is descriptive, not a production percentile estimate.",
+    "Severe laptop memory pressure; no Xeon performance extrapolation.",
+    "Local PostgreSQL tools, BGE-M3 and cross encoder absent. No migration or embedding promotion."
+  ]
+}

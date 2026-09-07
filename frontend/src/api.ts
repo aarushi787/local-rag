@@ -1,6 +1,6 @@
 export type Source = {
   index: number;
-  id: number;
+  id: number | string;
   document_id?: string | null;
   source: string;
   filename: string;
@@ -11,6 +11,7 @@ export type Source = {
   similarity: number;
   rerank_score: number;
   quote: string;
+  evidence_text?: string;
 };
 
 export type Metrics = {
@@ -30,6 +31,13 @@ export type Metrics = {
   total_ms?: number;
   profile?: string | null;
   cache_hit?: boolean;
+  grounding_validation?: {
+    valid: boolean;
+    applicable: boolean;
+    refusal?: boolean;
+    blocked_original_answer?: boolean;
+    method?: string;
+  };
 };
 
 export type ResponseProfile = {

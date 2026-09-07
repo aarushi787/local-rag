@@ -539,7 +539,7 @@ class RagSecurityAndBehaviorTests(unittest.TestCase):
         grounded = app.score_generated_answer(
             {"required_facts": ["7 GB"], "should_refuse": False},
             "Peak memory is 7 GB [Source 1].",
-            [{"index": 1}],
+            [{"index": 1, "quote": "Peak memory is 7 GB."}],
         )
         self.assertTrue(grounded["citation_correct"])
         self.assertTrue(grounded["grounded"])

@@ -9,6 +9,9 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'assert-local-postgres.ps1')
+Assert-LocalPostgresTarget -ConnectionUrl $DisposableDatabaseUrl
+if (-not $ConfirmTargetIsDisposable) { throw 'Explicit disposable-target confirmation is required.' }
 $backup = (Resolve-Path -LiteralPath $BackupFile).Path
 if ([System.IO.Path]::GetExtension($backup) -ne '.dump') {
     throw 'BackupFile must be a custom-format .dump created by backup-local-postgres.ps1.'
@@ -26,16 +29,16 @@ $psql = (Get-Command psql.exe -ErrorAction Stop).Source
 & $pgRestore --list $backup | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'The backup archive cannot be read.' }
 
-$existing = & $psql $DisposableDatabaseUrl --tuples-only --no-align --command "SELECT COUNT(*) FROM pg_tables WHERE schemaname='public' AND tablename LIKE 'rag_%';"
+$existing = & $psql $DisposableDatabaseUrl --tuples-only --no-align --command "SELECT COUNT(*) FROM pg_tables WHERE schemaname='public';"
 if ($LASTEXITCODE -ne 0) { throw 'Could not inspect the disposable target.' }
 if ([int]$existing -ne 0) {
     throw 'Disposable target is not empty. Create a new empty restore-test database.'
 }
 
-& $pgRestore --exit-on-error --no-owner --no-acl --dbname=$DisposableDatabaseUrl $backup
+& $pgRestore --single-transaction --exit-on-error --no-owner --no-acl --dbname=$DisposableDatabaseUrl $backup
 if ($LASTEXITCODE -ne 0) { throw 'Restore verification failed during pg_restore.' }
 
 $counts = & $psql $DisposableDatabaseUrl --no-align --field-separator=',' --command "SELECT (SELECT COUNT(*) FROM rag_documents) AS documents, (SELECT COUNT(*) FROM rag_chunks) AS chunks, (SELECT COUNT(*) FROM rag_users) AS users;"
 if ($LASTEXITCODE -ne 0) { throw 'Restore completed but integrity queries failed.' }
-Write-Host 'Restore verification passed on the disposable database.'
+Write-Host 'Restore smoke check passed. Counts alone do not verify content or embeddings; run verify-migration.py before cutover.'
 Write-Host $counts
