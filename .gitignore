@@ -23,4 +23,5 @@ models/*.gguf
 models/*.safetensors
 server-build/artifacts/
 local-infrastructure/.env
+local-infrastructure/phase1-validation-logs/
 backups/

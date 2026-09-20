@@ -56,11 +56,14 @@ import {
   getIngestionJobs,
   getModels,
   getProfiles,
+  getAssistantModes,
   getCurrentUser,
   getUsers,
   Health,
   Metrics,
   ResponseProfile,
+  AssistantMode,
+  AssistantModeInfo,
   renameConversation,
   EvaluationRun,
   IngestionJob,
@@ -124,6 +127,8 @@ function App() {
   const [model, setModel] = useState("gemma4:e2b-it-qat");
   const [profiles, setProfiles] = useState<ResponseProfile[]>([]);
   const [profile, setProfile] = useState<ResponseProfile["id"]>("auto");
+  const [assistantModes, setAssistantModes] = useState<AssistantModeInfo[]>([]);
+  const [assistantMode, setAssistantMode] = useState<AssistantMode>("company_knowledge");
   const [currentUser, setCurrentUser] = useState<CurrentUser | null>(null);
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [conversationId, setConversationId] = useState<string | null>(null);
@@ -251,9 +256,10 @@ function App() {
   const refreshWorkspace = async () => {
     try {
       const me = await getCurrentUser();
-      const [availableModels, responseProfiles, savedConversations, indexedDocuments, jobs] = await Promise.all([
+      const [availableModels, responseProfiles, modeCapabilities, savedConversations, indexedDocuments, jobs] = await Promise.all([
         getModels(),
         getProfiles(),
+        getAssistantModes(),
         getConversations(),
         getDocuments(),
         getIngestionJobs()
@@ -261,6 +267,7 @@ function App() {
       setCurrentUser(me);
       setModels(availableModels);
       setProfiles(responseProfiles);
+      setAssistantModes(modeCapabilities);
       setConversations(savedConversations);
       setDocuments(indexedDocuments);
       setIngestionJobs(jobs);
@@ -464,6 +471,7 @@ function App() {
           conversation_id: conversationId || undefined,
           document_id: selectedDocument === "all" ? undefined : selectedDocument,
           profile,
+          assistant_mode: assistantMode,
           stream: true,
           max_tokens: 220,
           replace_last: replaceLast
@@ -575,6 +583,11 @@ function App() {
     setProfile(value);
     const selected = profiles.find((item) => item.id === value);
     if (selected) setModel(selected.model);
+  };
+
+  const changeAssistantMode = (value: AssistantMode) => {
+    setAssistantMode(value);
+    if (value !== "company_knowledge") setSelectedDocument("all");
   };
 
   const submitUpload = async (event: FormEvent) => {
@@ -747,6 +760,22 @@ function App() {
               <List />
             </IconButton>
             <div className="topbar-control mode-control">
+              <Books aria-hidden="true" />
+              <span className="control-label">Assistant</span>
+              <Select.Root value={assistantMode} onValueChange={(value) => changeAssistantMode(value as AssistantMode)} disabled={generating}>
+                <Select.Trigger aria-label="Assistant mode" />
+                <Select.Content>
+                  {(assistantModes.length ? assistantModes : [
+                    { id: "company_knowledge", label: "Company Knowledge", description: "Cited private documents", available: true },
+                    { id: "general", label: "General Assistant", description: "No company-document search", available: true },
+                    { id: "business_analytics", label: "Business Analytics", description: "Requires approved data", available: false }
+                  ]).map((item) => (
+                    <Select.Item value={item.id} key={item.id} disabled={!item.available}>{item.label}</Select.Item>
+                  ))}
+                </Select.Content>
+              </Select.Root>
+            </div>
+            <div className="topbar-control mode-control">
               <Gauge aria-hidden="true" />
               <span className="control-label">Response</span>
               <Select.Root value={profile} onValueChange={(value) => changeProfile(value as ResponseProfile["id"])} disabled={generating}>
@@ -766,7 +795,7 @@ function App() {
             <div className="topbar-control document-control">
               <FileText aria-hidden="true" />
               <span className="control-label">Scope</span>
-              <Select.Root value={selectedDocument} onValueChange={setSelectedDocument} disabled={generating}>
+              <Select.Root value={selectedDocument} onValueChange={setSelectedDocument} disabled={generating || assistantMode !== "company_knowledge"}>
                 <Select.Trigger aria-label="Search scope" />
                 <Select.Content>
                   <Select.Item value="all">All documents</Select.Item>

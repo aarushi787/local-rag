@@ -1,5 +1,8 @@
 # Optional Gemma customization
 
+For the supplied MCCIA Drive archive, see [MCCIA_DATA_REVIEW.md](MCCIA_DATA_REVIEW.md).
+Its source-review pack is not yet an approved fine-tuning dataset.
+
 ## Level A: prompt profile
 
 This is the recommended customization for the current CPU-only laptop. It does

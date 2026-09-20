@@ -30,6 +30,7 @@ export type Metrics = {
   queue_wait_ms?: number;
   total_ms?: number;
   profile?: string | null;
+  assistant_mode?: AssistantMode;
   cache_hit?: boolean;
   grounding_validation?: {
     valid: boolean;
@@ -38,6 +39,15 @@ export type Metrics = {
     blocked_original_answer?: boolean;
     method?: string;
   };
+};
+
+export type AssistantMode = "company_knowledge" | "general" | "business_analytics";
+
+export type AssistantModeInfo = {
+  id: AssistantMode;
+  label: string;
+  description: string;
+  available: boolean;
 };
 
 export type ResponseProfile = {
@@ -219,6 +229,11 @@ export async function getProfiles(): Promise<ResponseProfile[]> {
   return payload.data;
 }
 
+export async function getAssistantModes(): Promise<AssistantModeInfo[]> {
+  const payload = await requestJson<{ data: AssistantModeInfo[] }>("/v1/assistant-modes");
+  return payload.data;
+}
+
 export const getCurrentUser = () => requestJson<CurrentUser>("/v1/me");
 
 export async function getIngestionJobs(): Promise<IngestionJob[]> {
@@ -318,6 +333,7 @@ export async function streamChat(
     conversation_id?: string;
     document_id?: string;
     profile?: "auto" | "fast" | "balanced" | "quality";
+    assistant_mode?: AssistantMode;
     stream: true;
     max_tokens: number;
     replace_last?: boolean;

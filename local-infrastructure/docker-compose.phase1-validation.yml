@@ -1,0 +1,24 @@
+# Disposable acceptance database only. It is intentionally separate from the
+# normal local-infrastructure/docker-compose.yml service and has no restart policy.
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: "no"
+    mem_limit: 768m
+    environment:
+      POSTGRES_DB: rag_phase1_test_local
+      POSTGRES_USER: rag_phase1_owner
+      POSTGRES_PASSWORD: ${PHASE1_POSTGRES_PASSWORD:?Set only through the validation runner}
+    ports:
+      - "127.0.0.1:${PHASE1_POSTGRES_PORT:?Set only through the validation runner}:5432"
+    volumes:
+      - phase1_validation_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+
+volumes:
+  phase1_validation_postgres_data:

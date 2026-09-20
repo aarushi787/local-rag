@@ -1,0 +1,4 @@
+# Offline HTTP contract tests; already verified on this Windows environment.
+# httpx 0.28.1 is BSD-3-Clause; runtime application dependencies are unchanged.
+-r requirements-rag.txt
+httpx==0.28.1

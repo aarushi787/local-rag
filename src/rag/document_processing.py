@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 
 SUPPORTED_EXTENSIONS = {
@@ -156,7 +157,10 @@ def _ocr_paths(project_dir: Path) -> tuple[Path, Path]:
     return python_path, script_path
 
 
-def _ocr_image(data: bytes, suffix: str, page_number: int, project_dir: Path) -> DocumentPage:
+def _ocr_image(data: bytes, suffix: str, page_number: int, project_dir: Path,
+               resource_check: Callable[[], object] | None = None) -> DocumentPage:
+    if resource_check:
+        resource_check()
     python_path, script_path = _ocr_paths(project_dir)
     ocr_environment = os.environ.copy()
     ocr_environment.setdefault(
@@ -212,12 +216,15 @@ def _ocr_image(data: bytes, suffix: str, page_number: int, project_dir: Path) ->
     )
 
 
-def _extract_pdf(data: bytes, project_dir: Path) -> list[DocumentPage]:
+def _extract_pdf(data: bytes, project_dir: Path,
+                 resource_check: Callable[[], object] | None = None) -> list[DocumentPage]:
     import pymupdf
 
     pages: list[DocumentPage] = []
     with pymupdf.open(stream=data, filetype="pdf") as document:
         for page_index, page in enumerate(document, start=1):
+            if resource_check:
+                resource_check()
             blocks: list[TextBlock] = []
             for block in page.get_text("blocks"):
                 text = str(block[4]).strip()
@@ -232,7 +239,7 @@ def _extract_pdf(data: bytes, project_dir: Path) -> list[DocumentPage]:
             if len(text.strip()) < 20:
                 pixmap = page.get_pixmap(matrix=pymupdf.Matrix(2, 2), alpha=False)
                 pages.append(
-                    _ocr_image(pixmap.tobytes("png"), ".png", page_index, project_dir)
+                    _ocr_image(pixmap.tobytes("png"), ".png", page_index, project_dir, resource_check)
                 )
             else:
                 pages.append(
@@ -291,7 +298,10 @@ def extract_document(
     filename: str,
     content_type: str | None,
     project_dir: Path,
+    resource_check: Callable[[], object] | None = None,
 ) -> ParsedDocument:
+    if resource_check:
+        resource_check()
     extension = Path(filename).suffix.lower()
     if extension not in SUPPORTED_EXTENSIONS:
         supported = ", ".join(sorted(SUPPORTED_EXTENSIONS))
@@ -309,9 +319,9 @@ def extract_document(
     elif extension == ".xlsx":
         pages = _extract_xlsx(data)
     elif extension == ".pdf":
-        pages = _extract_pdf(data, project_dir)
+        pages = _extract_pdf(data, project_dir, resource_check)
     else:
-        pages = [_ocr_image(data, extension, 1, project_dir)]
+        pages = [_ocr_image(data, extension, 1, project_dir, resource_check)]
 
     if not any(page.text.strip() for page in pages):
         raise ValueError("The document contains no readable text")

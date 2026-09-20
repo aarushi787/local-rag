@@ -1,5 +1,10 @@
 # Local RAG API
 
+> **Phase 1 safety changes:** See [baseline, verification and deployment handoff](docs/PHASE1_HANDOFF.md).
+> Anonymous administration is disabled, migrations default to off, and replacement
+> keeps the document ID/permissions in one activation transaction. These changes
+> have not been deployed or verified against the live database.
+
 > **New user?** See [Setup and access from any device](USER_SETUP_GUIDE.md) for browser access, personal keys, private remote/LAN access, Windows installation and troubleshooting. The guide distinguishes the current custom app from the separate Open WebUI build kit.
 
 > **Xeon server deployment:** The guarded Windows Server 2025 build kit for
@@ -16,7 +21,7 @@ The included React interface adds saved conversations, document upload,
 citations, queue status, model selection, stop-generation controls, and a
 responsive layout for laptops, tablets, and phones.
 
-The interface includes an Auto mode that routes simple prompts to Fast, normal
+When `AUTO_MODEL_ROUTING=true`, Auto mode routes simple prompts to Fast, normal
 questions to Balanced, and complex analysis to Quality. Fast uses
 `gemma3:1b-it-qat`, Balanced uses `qwen3:1.7b`, and Quality uses the configured
 Gemma model. A knowledge selector can search every document or restrict retrieval
@@ -65,26 +70,33 @@ ollama serve
 
 ### Window 2: FastAPI
 
-Paste the actual pooled Neon URL. Never share that value because it contains
-the database password.
+For a new installation only, create a private `.env` from `.env.example` without
+overwriting an existing file. Configure the intended runtime database URL and a
+secure random ASCII `RAG_API_KEY` of at least 32 characters. Do not rotate an
+existing key as part of routine startup. `REQUIRE_API_KEY=false` no longer permits
+anonymous access. Never share the connection URL or key.
+
+**Schema changes are a separate, explicit maintenance operation.** A new empty
+database must be initialized first using an owner connection in a separate
+PowerShell session. For an existing database, obtain approval and a tested backup
+before running `app.initialize_database()`; its existing migration runner uses
+autocommit, so an interrupted migration is not automatically rolled back. Follow
+the [Phase 1 bootstrap and grants instructions](docs/PHASE1_HANDOFF.md).
+
+Start normally with the runtime connection from `.env`, not the migration-owner
+connection. The following does not rotate keys or apply migrations:
 
 ```powershell
 Set-Location "C:\Users\Aarushi Gupta\Documents\ChatGPT\LLM Project"
 .\.venv-rag\Scripts\Activate.ps1
 
-$env:DATABASE_URL = Read-Host "Paste the actual Neon pooled connection URL"
-$env:RAG_API_KEY = [guid]::NewGuid().ToString("N") + [guid]::NewGuid().ToString("N")
-$env:RAG_API_KEY
-$env:REQUIRE_API_KEY = "true"
-$env:RUN_MIGRATIONS = "true"
+$env:RUN_MIGRATIONS = "false"
 
 uvicorn app:app --host 127.0.0.1 --port 8000 --workers 1
 ```
 
-Starting the server applies the new schema and safely attaches existing chunks
-to document records. Keep this window open. Keep the generated API key for calls
-from another PowerShell window; alternatively store settings in a local `.env`
-file, which is excluded by `.gitignore`.
+Keep this window open. The private `.env` is excluded by `.gitignore`.
+Starting with missing/weak administrator credentials fails closed.
 
 Open the interactive documentation at <http://127.0.0.1:8000/docs>.
 Open the chat interface at <http://127.0.0.1:8000/>. On first use, paste the
@@ -94,12 +106,14 @@ secondary laptop. The browser keeps the API key in session storage and clears
 it when that browser session ends. The server address is stored locally on that
 device.
 
-The frontend renders token-by-token Markdown and expandable citations with
+The frontend renders Markdown and expandable citations with
 filename, page, and relevance. It supports stop, regenerate, edit-and-resend,
 copy, conversation search/rename/delete/export, drag-and-drop uploads, ingestion
 progress, document search/filter/delete, response profiles, component status,
 latency metrics, keyboard shortcuts, per-user access, and light/dark responsive
 layouts. Retrieval internals and the evaluation dashboard remain administrator-only.
+With strict grounded-answer validation enabled, answer text is buffered until
+validation finishes. Streaming status events are not a promise of immediate text.
 
 ## Build or deploy the frontend
 
